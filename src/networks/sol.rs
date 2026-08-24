@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep};
+use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 use hmac::{Hmac, KeyInit, Mac}; // Added KeyInit here
@@ -21,6 +22,7 @@ use rust_decimal::Decimal;
 
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Map, Value};
+use tokio::sync::RwLock;
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -61,7 +63,6 @@ const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-
 
 // ---------- derivation path ----------
 
@@ -276,6 +277,17 @@ const CONF_FINALIZED: i64 = 32;
 
 const DETECT_COMMITMENT: &str = "confirmed";
 const FINALIZED_COMMITMENT: &str = "finalized";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Blockhash
+// ─────────────────────────────────────────────────────────────────────────────
+pub const BLOCKHASH_COMMITMENT: &str = "confirmed";
+const BLOCKHASH_CACHE_TTL: Duration = Duration::from_secs(3);
+#[derive(Clone, Debug)]
+pub struct RecentBlockhash {
+    pub blockhash: String,
+    pub last_valid_block_height: u64,
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Confirmation levels
 // ─────────────────────────────────────────────────────────────────────────────
@@ -482,6 +494,7 @@ pub struct SolanaNetwork {
     rpc_urls: Vec<String>,
     pub network_name: String,
     client: reqwest::Client,
+    blockhash_cache: RwLock<Option<(RecentBlockhash, Instant)>>,
 }
 
 impl SolanaNetwork {
@@ -494,6 +507,7 @@ impl SolanaNetwork {
             rpc_urls,
             network_name,
             client: reqwest::Client::new(),
+            blockhash_cache: RwLock::new(None),
         }
     }
 
@@ -631,6 +645,39 @@ impl SolanaNetwork {
     async fn get_slot(&self, commitment: &str) -> Result<i64, String> {
         let v = self.rpc("getSlot", json!([{ "commitment": commitment }])).await?;
         v.as_i64().ok_or_else(|| format!("getSlot returned non-integer: {v}"))
+    }
+
+    pub async fn get_recent_blockhash(&self) -> Result<RecentBlockhash, String> {
+        {
+            let guard = self.blockhash_cache.read().await;
+            if let Some((cached, fetched_at)) = guard.as_ref() {
+                if fetched_at.elapsed() < BLOCKHASH_CACHE_TTL {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        let res = self
+            .rpc("getLatestBlockhash", json!([{ "commitment": BLOCKHASH_COMMITMENT }]))
+            .await?;
+
+        // getLatestBlockhash wraps its payload in { context, value }.
+        let value = res.get("value").unwrap_or(&res);
+
+        let blockhash = value
+            .get("blockhash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("getLatestBlockhash returned no blockhash: {res}"))?
+            .to_string();
+
+        let last_valid_block_height = value
+            .get("lastValidBlockHeight")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("getLatestBlockhash returned no lastValidBlockHeight: {res}"))?;
+
+        let fresh = RecentBlockhash { blockhash, last_valid_block_height };
+        *self.blockhash_cache.write().await = Some((fresh.clone(), Instant::now()));
+        Ok(fresh)
     }
 
     // ── The service loop ─────────────────────────────────────────────────────

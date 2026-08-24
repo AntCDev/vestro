@@ -5,7 +5,7 @@ use tower_http::compression::CompressionLayer;
 use std::env;
 use std::sync::Arc;
 use axum::{routing::{get, post}, Router};
-use crate::api::invoices::{get_invoice_checkout_handler, get_invoice_status_handler};
+use crate::api::invoices::{get_invoice_blockhash_handler, get_invoice_checkout_handler, get_invoice_status_handler};
 
 // Register our modules globally
 mod networks;
@@ -92,6 +92,7 @@ async fn main() {
         .route("/invoice", get(api::invoices::invoice_redirect_handler))
         .route("/api/invoices/{id}/checkout", get(get_invoice_checkout_handler))
         .route("/api/invoices/{id}/status",   get(get_invoice_status_handler))
+        .route("/api/invoices/{id}/solana/blockhash", get(get_invoice_blockhash_handler))
 
         // Inspection / Test routes
         .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))

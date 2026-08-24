@@ -1,6 +1,6 @@
 use crate::networks::sol::SolanaNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry, SolanaCluster};
-use crate::tokens::{decrypt_data, CheckoutContext, CheckoutView, PaymentDetails, TokenHandler, TokenRegistry};
+use crate::tokens::{decrypt_data, CheckoutContext, CheckoutView, PaymentDetails, PresignContext, TokenHandler, TokenRegistry};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
@@ -313,4 +313,16 @@ impl TokenHandler for DevnetHandler {
         Ok(())
     }
 
+    async fn presign_data(
+        &self,
+        _pool: &PgPool,
+        _ctx: &PresignContext,
+    ) -> Result<Value, String> {
+        let bh = self.network.get_recent_blockhash().await?;
+        Ok(json!({
+            "blockhash": bh.blockhash,
+            "last_valid_block_height": bh.last_valid_block_height,
+            "commitment": crate::networks::sol::BLOCKHASH_COMMITMENT,
+        }))
+    }
 }

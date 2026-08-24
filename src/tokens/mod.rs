@@ -84,7 +84,12 @@ pub struct PaymentDetails {
     pub wallet_index: u32,
     pub expires_at: DateTime<Utc>,
 }
-
+pub struct PresignContext {
+    pub invoice_id: Uuid,
+    pub token_id: String,
+    pub status: String,
+    pub expires_at: DateTime<Utc>,
+}
 #[async_trait]
 pub trait TokenHandler: Send + Sync {
     fn token_id(&self) -> &str;
@@ -136,6 +141,26 @@ pub trait TokenHandler: Send + Sync {
     ) -> Result<Value, String> {
         Ok(Value::Null)
     }
+
+    /// Fresh, per-attempt data the wallet needs to build a signable
+    /// transaction — a Solana blockhash, an EVM nonce and fee estimate.
+    ///
+    /// Unlike checkout_data this runs on every payment attempt, and it is
+    /// allowed to hit the network; handlers cache if that call is expensive.
+    ///
+    /// PUBLIC, on the same terms as checkout_data: the invoice UUID is the
+    /// only gate. This returns facts about the chain, never anything derived
+    /// from a key, and the server signs nothing on this path.
+    ///
+    /// `Value::Null` means "this token has no pre-sign step", which the API
+    /// turns into a 400 rather than handing the page an empty object.
+    async fn presign_data(
+        &self,
+        _pool: &PgPool,
+        _ctx: &PresignContext,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }    
 }
 
 #[derive(Clone, Serialize)]

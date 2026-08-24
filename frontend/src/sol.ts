@@ -11,11 +11,11 @@ if (!(globalThis as unknown as { Buffer?: unknown }).Buffer) {
    ════════════════════════════════════════════════════════════════════════════ */
 
 /** Reown (WalletConnect) project id — https://dashboard.reown.com */
-const REOWN_PROJECT_ID = 'TODO_REOWN_PROJECT_ID';
+const REOWN_PROJECT_ID = '7aba1a66fad0cbd0745cca56acc6ee6f';
 
 /** Shown inside the wallet's approval sheet. Must match the deployed origin. */
 const APP_METADATA = {
-  name: 'TODO — Merchant name',
+  name: 'rust-crypto',
   description: 'Invoice payment',
   url: window.location.origin, // must match the origin the page is served from
   icons: ['TODO_ABSOLUTE_URL_TO_ICON_PNG'],
@@ -603,18 +603,6 @@ interface BlockhashResponse {
   last_valid_block_height?: number;
 }
 
-/**
- * TODO(backend) — GET /api/invoices/:id/solana/blockhash
- *
- * sends:    nothing but the invoice id in the path
- * expects:  200 { "blockhash": "9xQeW…", "last_valid_block_height": 291043112 }
- *           404 if the invoice is unknown, 409 if it is already settled or expired
- *
- * Server side this is one getLatestBlockhash("confirmed") against your keyed
- * RPC. Cheap enough to call per attempt; cache it for a second or two if you
- * want, but don't cache past ~30s or the transaction will expire before it
- * lands.
- */
 async function fetchRecentBlockhash(): Promise<BlockhashResponse> {
   const res = await fetch(ENDPOINTS.blockhash(invoiceId), {
     method: 'GET',

@@ -12,7 +12,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
-use crate::tokens::{CheckoutContext, StatusContext};
+use crate::tokens::{CheckoutContext, PresignContext, StatusContext};
 
 #[derive(Deserialize)]
 pub struct CreateInvoiceRequest {
@@ -295,7 +295,6 @@ pub async fn get_invoice_checkout_handler(
     }))
 }
 
-
 /// GET /api/invoices/:id/status   (polled)
 pub async fn get_invoice_status_handler(
     State(state): State<AppState>,
@@ -373,4 +372,63 @@ pub async fn get_invoice_status_handler(
             .collect(),
         data,
     }))
+}
+
+/// GET /api/invoices/:id/solana/blockhash
+///
+/// Read-only. Returns chain state so the browser can finish a transaction it
+/// built itself. No key material, no signing, no relay.
+#[derive(sqlx::FromRow)]
+struct PresignInvoiceRow {
+    token_id: String,
+    status: String,
+    expires_at: DateTime<Utc>,
+}
+const CLOSED: &[&str] = &["paid", "confirmed", "expired", "cancelled", "refunded"];
+
+pub async fn get_invoice_blockhash_handler(
+    State(state): State<AppState>,
+    Path(invoice_id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let inv = sqlx::query_as::<_, PresignInvoiceRow>(
+        r#"SELECT token_id, status, expires_at FROM invoices WHERE id = $1"#,
+    )
+        .bind(invoice_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "invoice not found".to_string()))?;
+
+    if CLOSED.contains(&inv.status.as_str()) {
+        return Err((StatusCode::CONFLICT, format!("invoice is {}", inv.status)));
+    }
+    if inv.expires_at <= Utc::now() {
+        return Err((StatusCode::CONFLICT, "invoice expired".to_string()));
+    }
+
+    let handler = state.registry.get_handler(&inv.token_id).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("no handler registered for token {}", inv.token_id),
+    ))?;
+
+    let ctx = PresignContext {
+        invoice_id,
+        token_id: inv.token_id.clone(),
+        status: inv.status,
+        expires_at: inv.expires_at,
+    };
+
+    let data = handler
+        .presign_data(&state.pool, &ctx)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    if data.is_null() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("token {} has no pre-sign step", inv.token_id),
+        ));
+    }
+
+    Ok(Json(data))
 }

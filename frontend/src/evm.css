@@ -1,0 +1,149 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   EVM checkout theme
+
+   Sibling of sol.css: same token *names*, so both views share one structural
+   vocabulary and only the palette moves. Solana's surface is warm-black with a
+   teal→violet neon gradient; this one is graphite with periwinkle, which is
+   where Ethereum's own material sits. Nothing here is neon — an EVM payment
+   involves an approval, a chain id and calldata, and the surface should read
+   like an instrument panel rather than a light show.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@theme {
+  /* surfaces — cool graphite, blue-shifted rather than neutral */
+  --color-ink: #070811;
+  --color-panel: #0d0f1a;
+  --color-panel-2: #141827;
+  --color-line: #212639;
+
+  /* text */
+  --color-chalk: #e8eaf5;
+  --color-mist: #848bab;
+
+  /* accent — periwinkle, the Ethereum family */
+  --color-eth: #7b8bf5;
+  --color-eth-deep: #4356c9;
+  --color-iris: #b3bdff;
+
+  /* state */
+  --color-rose: #ef6b7d;
+  --color-amber: #e0a94a;
+
+  --radius-panel: 14px;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+    /* one ambient light source, fixed so it doesn't travel on scroll */
+    background-image: radial-gradient(
+      48rem 26rem at 50% -6rem,
+      color-mix(in oklab, var(--color-eth) 14%, transparent),
+      transparent 70%
+    );
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-eth);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+@layer components {
+  /* The one surface treatment. A hairline top highlight is the only bevel;
+     everything else is flat, because the page already has a lot of state. */
+  .panel-edge {
+    border: 1px solid var(--color-line);
+    background: var(--color-panel);
+    border-radius: var(--radius-panel);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.035);
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.2;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--color-mist);
+  }
+
+  /* Progress, fuse and the primary button all share one ramp so "filled"
+     means the same thing everywhere on the page. */
+  .grad-bar {
+    background-image: linear-gradient(
+      90deg,
+      var(--color-eth-deep) 0%,
+      var(--color-eth) 55%,
+      var(--color-iris) 100%
+    );
+  }
+
+  .grad-text {
+    background-image: linear-gradient(
+      100deg,
+      var(--color-chalk) 0%,
+      var(--color-iris) 55%,
+      var(--color-eth) 100%
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Live-but-waiting. Used on the status dot and the loading pip. */
+  .breathe {
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+
+  @keyframes breathe {
+    0%,
+    100% {
+      opacity: 0.35;
+      transform: scale(0.85);
+    }
+    50% {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  /* The step rail: a hairline connecting the dots down the left of the wallet
+     path. EVM is the chain where paying is genuinely a sequence, so the rail
+     is load-bearing here in a way it wouldn't be on Solana. */
+  .rail {
+    position: relative;
+  }
+
+  .rail::before {
+    content: "";
+    position: absolute;
+    left: 2px;
+    top: 14px;
+    bottom: 14px;
+    width: 1px;
+    background: var(--color-line);
+  }
+
+  .rail > * {
+    position: relative;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .breathe {
+      animation: none;
+      opacity: 0.9;
+    }
+    * {
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

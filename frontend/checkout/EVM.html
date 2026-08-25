@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex" />
+  <title>Pay on EVM</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/src/evm.css" />
+</head>
+<body class="bg-ink text-chalk min-h-screen antialiased">
+
+<div class="mx-auto w-full max-w-[27rem] px-4 py-8 md:py-14">
+
+  <!-- ═══════════════════ ERRORS / NOTICES ═══════════════════ -->
+  <div id="error-box"
+       class="hidden mb-4 rounded-panel border border-rose/30 bg-rose/10 px-4 py-3 text-[13px] leading-relaxed text-rose"></div>
+  <div id="notice-box"
+       class="hidden mb-4 rounded-panel border border-eth/25 bg-eth/8 px-4 py-3 text-[13px] leading-relaxed text-iris"></div>
+
+  <!-- ═══════════════════ LOADING ═══════════════════ -->
+  <div id="loading-state" class="panel-edge px-6 py-16 text-center">
+    <div class="mx-auto h-1.5 w-1.5 rounded-full bg-eth breathe"></div>
+    <p class="mt-4 eyebrow">Loading invoice</p>
+  </div>
+
+  <!-- ═══════════════════ CHECKOUT ═══════════════════ -->
+  <main id="checkout-view" class="hidden">
+
+    <!-- ── The card ────────────────────────────────────────────
+         Header, amount and the expiry fuse share one surface so the
+         countdown reads as belonging to the amount, not to the page. -->
+    <section class="panel-edge overflow-hidden">
+
+      <!-- fuse: burns down left-to-right over the invoice lifetime -->
+      <div class="h-[3px] w-full bg-panel-2">
+        <div id="fuse-bar" class="h-full grad-bar transition-[width] duration-1000 ease-linear" style="width:100%"></div>
+      </div>
+
+      <header class="flex items-start justify-between gap-4 px-6 pt-5">
+        <div>
+          <p class="eyebrow">Amount due</p>
+          <p id="token-line" class="mt-2 font-mono text-[11px] text-mist"></p>
+        </div>
+        <div class="text-right">
+          <span id="status-pill"
+                class="inline-flex items-center gap-1.5 rounded-full border border-line bg-panel-2 px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-mist">
+            <span id="status-dot" class="h-1.5 w-1.5 rounded-full bg-mist"></span>
+            <span id="status-text">—</span>
+          </span>
+          <p id="expiry-line" class="mt-2 font-mono text-[11px] text-mist tabular-nums"></p>
+        </div>
+      </header>
+
+      <div class="px-6 pb-6 pt-3">
+        <div class="flex items-baseline gap-2">
+          <span id="amount-display" class="grad-text font-mono text-[2.6rem] font-semibold leading-none tracking-tight tabular-nums">—</span>
+          <span id="amount-symbol" class="font-mono text-lg font-medium text-mist"></span>
+        </div>
+        <p id="amount-base" class="mt-2 font-mono text-[11px] text-mist/70"></p>
+
+        <!-- Chain identity sits with the amount, not with the buttons: on EVM
+             the chain is part of what is owed, not a delivery detail. -->
+        <div class="mt-4 flex items-center gap-2 border-t border-line pt-3">
+          <svg viewBox="0 0 16 24" class="h-3.5 w-2.5 shrink-0" aria-hidden="true">
+            <path d="M8 0 16 12 8 16.5 0 12Z" fill="currentColor" class="text-eth" opacity="0.55" />
+            <path d="M8 18 16 13.5 8 24 0 13.5Z" fill="currentColor" class="text-iris" opacity="0.9" />
+          </svg>
+          <span id="chain-name" class="font-mono text-[11px] text-chalk"></span>
+          <span id="chain-id" class="font-mono text-[10px] text-mist/70"></span>
+        </div>
+
+        <!-- partial payment ledger line: only appears once something lands -->
+        <div id="received-row" class="hidden mt-4 border-t border-line pt-3">
+          <div class="flex items-baseline justify-between font-mono text-[11px]">
+            <span class="text-mist">Received</span>
+            <span id="amount-received" class="tabular-nums text-chalk">—</span>
+          </div>
+          <div class="mt-2 h-[2px] w-full bg-panel-2">
+            <div id="received-bar" class="h-full grad-bar transition-[width] duration-700" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Path switch ────────────────────────────────────────
+         Two ways to pay. The contract call is preselected and carries the
+         accent; the plain transfer stays available but visually quiet. -->
+    <div id="tabs" class="mt-5 grid grid-cols-2 gap-1 rounded-panel border border-line bg-panel p-1" role="tablist" aria-label="Payment method">
+      <button id="tab-wallet" type="button" role="tab" aria-selected="true" aria-controls="panel-wallet"
+              class="rounded-[10px] px-3 py-2.5 text-[13px] font-medium transition-colors cursor-pointer">
+        Pay from wallet
+      </button>
+      <button id="tab-manual" type="button" role="tab" aria-selected="false" aria-controls="panel-manual"
+              class="rounded-[10px] px-3 py-2.5 text-[13px] font-medium transition-colors cursor-pointer">
+        Send it yourself
+      </button>
+    </div>
+
+    <!-- ═══════════ PATH A — contract call (recommended) ═══════════ -->
+    <section id="panel-wallet" role="tabpanel" aria-labelledby="tab-wallet" class="mt-4 panel-edge p-6">
+      <p class="text-[13px] leading-relaxed text-mist">
+        Your wallet sends this payment through our payment system, which forwards the funds to the merchant
+        right away. The network, the token and the exact amount are all locked in — nothing to double check.
+      </p>
+
+      <!-- Wrong-network banner. Appears only when the wallet's chain id and
+           the invoice's chain id disagree. -->
+      <div id="network-row" class="hidden mt-4 flex items-start gap-3 rounded-[10px] border border-amber/25 bg-amber/8 px-3 py-2.5">
+        <div class="flex-1">
+          <p id="network-detail" class="font-mono text-[11px] leading-relaxed text-amber/90"></p>
+        </div>
+        <button id="btn-switch" type="button"
+                class="shrink-0 self-center rounded-[8px] border border-amber/40 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.14em] text-amber transition-colors hover:bg-amber/10 cursor-pointer">
+          Switch
+        </button>
+      </div>
+
+      <div class="mt-5 space-y-4 rail">
+        <!-- step 1 — connect -->
+        <div class="flex items-start gap-3">
+          <span id="step-1" class="mt-2.5 h-1.5 w-1.5 shrink-0 rounded-full bg-eth"></span>
+          <div class="flex-1">
+            <button id="btn-connect" type="button"
+                    class="w-full rounded-[10px] bg-chalk px-4 py-3 text-[14px] font-semibold text-ink transition-transform duration-150 hover:bg-white active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer">
+              Connect wallet
+            </button>
+            <p id="connect-detail" class="mt-1.5 font-mono text-[11px] leading-relaxed text-mist break-all"></p>
+          </div>
+        </div>
+
+        <!-- step 2 — approve (ERC-20 only; removed entirely for native) -->
+        <div id="approve-step" class="flex items-start gap-3">
+          <span id="step-2" class="mt-2.5 h-1.5 w-1.5 shrink-0 rounded-full bg-line"></span>
+          <div class="flex-1">
+            <button id="btn-approve" type="button" disabled
+                    class="w-full rounded-[10px] border border-line bg-panel-2 px-4 py-3 text-[14px] font-semibold text-chalk transition-colors hover:border-eth/50 disabled:cursor-not-allowed disabled:opacity-30 cursor-pointer">
+              Allow <span id="approve-symbol"></span>
+            </button>
+            <p id="approve-detail" class="mt-1.5 font-mono text-[11px] leading-relaxed text-mist break-all"></p>
+          </div>
+        </div>
+
+        <!-- step 3 — pay -->
+        <div class="flex items-start gap-3">
+          <span id="step-3" class="mt-2.5 h-1.5 w-1.5 shrink-0 rounded-full bg-line"></span>
+          <div class="flex-1">
+            <button id="btn-pay" type="button" disabled
+                    class="w-full rounded-[10px] grad-bar px-4 py-3 text-[14px] font-semibold text-ink transition-transform duration-150 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-25 cursor-pointer">
+              Pay
+            </button>
+            <p id="pay-detail" class="mt-1.5 font-mono text-[11px] leading-relaxed text-mist break-all"></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Answers the question every payer asks at the second signature. -->
+      <p id="approval-note" class="mt-4 font-mono text-[11px] leading-relaxed text-mist/70">
+        This takes two approvals in your wallet: the first allows this exact amount to be sent, the second
+        sends it. Nothing beyond this payment is ever authorized.
+      </p>
+
+      <!-- The call itself, for anyone who wants to read it before signing.
+           On EVM this is the honest equivalent of "check the QR". -->
+      <div class="mt-5 border-t border-line pt-4">
+        <button id="toggle-call" type="button"
+                class="eyebrow flex w-full items-center justify-between hover:text-chalk transition-colors cursor-pointer">
+          <span>What you&rsquo;re signing</span>
+          <span id="toggle-call-icon" class="font-mono text-xs">+</span>
+        </button>
+        <div id="call-block" class="hidden mt-4 space-y-2.5">
+          <div class="flex items-baseline justify-between gap-3">
+            <span class="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">Contract</span>
+            <span id="call-vault" class="font-mono text-[11px] break-all text-chalk"></span>
+          </div>
+          <div class="flex items-baseline justify-between gap-3">
+            <span class="font-mono text-[10px] uppercase tracking-[0.14em] text-mist/70">Function</span>
+            <span id="call-fn" class="font-mono text-[11px] text-chalk"></span>
+          </div>
+          <div id="call-args" class="space-y-1.5 border-t border-line pt-2.5"></div>
+        </div>
+      </div>
+
+      <!-- Shown instead of the steps when the chain has no vault configured. -->
+      <p id="no-smart-note" class="hidden mt-4 font-mono text-[11px] leading-relaxed text-amber/90">
+        No payment contract is configured for this chain. Use the plain transfer instead.
+      </p>
+    </section>
+
+    <!-- ═══════════ PATH B — plain transfer ═══════════ -->
+    <section id="panel-manual" role="tabpanel" aria-labelledby="tab-manual" class="hidden mt-4 panel-edge p-6">
+      <p class="text-[13px] leading-relaxed text-mist">
+        Send the exact amount to the address below from any wallet or exchange. Scan the QR with your wallet to
+        fill in the address, then select the <span id="manual-chain-inline" class="text-chalk"></span> network,
+        choose <span id="manual-token-inline" class="text-chalk"></span> and enter
+        <span id="manual-amount-inline" class="text-chalk"></span>.
+      </p>
+
+      <div class="mt-5 rounded-[10px] bg-white p-3">
+        <canvas id="address-qr" class="mx-auto block h-auto w-full max-w-[220px]"></canvas>
+      </div>
+
+      <div class="mt-5">
+        <p class="eyebrow">Deposit address</p>
+        <div class="mt-2 flex gap-2">
+          <div id="deposit-address"
+               class="flex-1 rounded-[10px] border border-line bg-panel-2 px-3 py-2.5 font-mono text-[11px] leading-relaxed break-all select-all text-chalk"></div>
+          <button id="copy-address" type="button"
+                  class="shrink-0 rounded-[10px] border border-line bg-panel-2 px-3 font-mono text-[11px] text-mist transition-colors hover:border-eth/50 hover:text-eth cursor-pointer">
+            Copy
+          </button>
+        </div>
+        <p id="token-note" class="hidden mt-2 font-mono text-[11px] leading-relaxed text-mist/70">
+          Token address <span id="token-note-symbol" class="text-chalk"></span>
+          <span id="token-address" class="select-all break-all"></span>. Check it matches the token
+          your wallet is about to send.
+        </p>
+      </div>
+
+      <div class="mt-4 flex gap-2.5 rounded-[10px] border border-amber/25 bg-amber/8 px-3 py-2.5">
+        <span class="mt-0.5 font-mono text-[11px] text-amber">!</span>
+        <p class="font-mono text-[11px] leading-relaxed text-amber/90">
+          Send only <span id="warn-symbol" class="font-semibold">this token</span> on
+          <span id="warn-chain" class="font-semibold">this chain</span>. The same address on another chain is
+          not the same account, and anything sent there is unrecoverable.
+        </p>
+      </div>
+
+    </section>
+
+    <!-- ═══════════ Payments seen ═══════════ -->
+    <section id="payments-section" class="hidden mt-4 panel-edge p-6">
+      <div class="flex items-baseline justify-between">
+        <p class="eyebrow">Payments seen</p>
+        <p id="payments-count" class="font-mono text-[11px] text-mist"></p>
+      </div>
+      <div id="payments-list" class="mt-4 space-y-3"></div>
+    </section>
+
+    <!-- ═══════════ Footer ═══════════ -->
+    <footer class="mt-5 flex items-center justify-between font-mono text-[10px] text-mist/60">
+      <span>Invoice <span id="invoice-id" class="select-all">—</span></span>
+      <span id="poll-indicator">Live</span>
+    </footer>
+
+  </main>
+</div>
+
+<script type="module" src="/src/evm.ts"></script>
+</body>
+</html>

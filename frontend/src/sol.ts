@@ -11,7 +11,7 @@ if (!(globalThis as unknown as { Buffer?: unknown }).Buffer) {
    ════════════════════════════════════════════════════════════════════════════ */
 
 /** Reown (WalletConnect) project id — https://dashboard.reown.com */
-const REOWN_PROJECT_ID = '7aba1a66fad0cbd0745cca56acc6ee6f';
+const REOWN_PROJECT_ID = import.meta.env.VITE_REOWN_PROJECT_ID || '';
 
 /** Shown inside the wallet's approval sheet. Must match the deployed origin. */
 const APP_METADATA = {
@@ -34,19 +34,6 @@ const ENDPOINTS = {
   blockhash: (id: string) => `/api/invoices/${encodeURIComponent(id)}/solana/blockhash`,
   submit: (id: string) => `/api/invoices/${encodeURIComponent(id)}/solana/submit`,
 };
-
-/**
- * Off: the wallet signs and broadcasts it itself, and the only server call is
- * for the blockhash. Nothing reaches your RPC that you didn't put there.
- *
- * On: the wallet only signs, and we POST the raw bytes for your server to
- * broadcast. Turn this on if you hit a wallet that implements
- * solana_signTransaction but not solana_signAndSendTransaction — mostly a
- * mobile-over-WalletConnect problem, injected wallets do both. If you do turn
- * it on, validate the transaction server-side before broadcasting; that
- * endpoint is otherwise an open relay pointed at your RPC quota.
- */
-const BROADCAST_VIA_BACKEND = false;
 
 /**
  * SPL only. The recipient's associated token account has to exist before a
@@ -612,47 +599,6 @@ async function fetchRecentBlockhash(): Promise<BlockhashResponse> {
   return (await res.json()) as BlockhashResponse;
 }
 
-interface SubmitResponse {
-  /** base58 transaction signature, echoed back for the explorer link */
-  signature: string;
-}
-
-/**
- * TODO(backend) — POST /api/invoices/:id/solana/submit
- * OPTIONAL. Only called when BROADCAST_VIA_BACKEND is on.
- *
- * sends:    { "transaction": "<base64 of the fully signed, serialized tx>" }
- * expects:  200 { "signature": "5Kd3…" }
- *           4xx with a plain-text or { "error": "…" } body — whatever you
- *           return here is shown to the payer verbatim, so keep it readable
- *
- * Server side: base64-decode, sendRawTransaction against your keyed RPC, and
- * return the signature. Deserialize and check it first — right destination,
- * right mint, amount >= amount_requested, reference present, no instructions
- * you didn't expect. A stranger's bytes can't spend anything of yours, but
- * without the check this endpoint will happily burn your RPC quota
- * broadcasting whatever it's handed.
- */
-async function submitSignedTransaction(transactionBase64: string): Promise<string> {
-  const res = await fetch(ENDPOINTS.submit(invoiceId), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ transaction: transactionBase64 }),
-  });
-  if (!res.ok) throw new Error((await res.text()) || 'the network rejected this transaction');
-  const body = (await res.json()) as SubmitResponse;
-  return body.signature;
-}
-
-/** Uint8Array -> base64, chunked so a large tx doesn't blow the call stack. */
-function toBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
 
 /** Step 2 — build, sign, send. One signature, no approval step. */
 async function sendPayment() {
@@ -749,26 +695,16 @@ async function sendPayment() {
 
     let signature: string;
 
-    if (!BROADCAST_VIA_BACKEND) {
-      // Default: the wallet signs and pushes it through its own RPC. Your
-      // server sees this payment the same way it sees a scanned Solana Pay
-      // transfer — when the watcher picks it up on chain.
-      if (!provider?.signAndSendTransaction) {
-        throw new Error(
-          'this wallet can sign but not broadcast — turn on BROADCAST_VIA_BACKEND to support it',
-        );
-      }
-      const result = await provider.signAndSendTransaction(tx);
-      signature = typeof result === 'string' ? result : (result.signature ?? '');
-    } else {
-      // Fallback: sign here, broadcast on the server.
-      if (!provider?.signTransaction) {
-        throw new Error('this wallet cannot sign Solana transactions in a browser');
-      }
-      const signed = await provider.signTransaction(tx);
-      detail.textContent = 'Broadcasting…';
-      signature = await submitSignedTransaction(toBase64(signed.serialize()));
+    // Default: the wallet signs and pushes it through its own RPC. Your
+    // server sees this payment the same way it sees a scanned Solana Pay
+    // transfer — when the watcher picks it up on chain.
+    if (!provider?.signAndSendTransaction) {
+      throw new Error(
+        'this wallet can sign but not broadcast — turn on BROADCAST_VIA_BACKEND to support it',
+      );
     }
+    const result = await provider.signAndSendTransaction(tx);
+    signature = typeof result === 'string' ? result : (result.signature ?? '');
 
     detail.textContent = signature ? `Sent · ${truncate(signature, 8, 8)}` : 'Sent';
     sendBtn.textContent = 'Sent';

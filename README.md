@@ -1,4 +1,4 @@
-# Multichain Payment Processor (Early Alpha)
+# Vestro (Early Alpha)
 
 > ⚠️ **Status: Early Alpha.** The core architecture is in place and the first major phase (invoice creation, payment observation across both payment paths, and webhook delivery) is complete — this project has graduated from proof-of-concept to early alpha. That said, large parts of the system (sweeping, ledgering, non-EVM networks) are still in progress or unimplemented, and nothing here has been audited. **Do not use this in production or with real funds.** See the [Roadmap & timeline](#roadmap--timeline) for exactly where things stand.
 

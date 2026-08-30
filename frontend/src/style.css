@@ -1,1 +1,448 @@
-@import "tailwindcss";
+/* =============================================================
+   Vestro — cold room
+   Append this to your existing style.css (keep your Tailwind
+   import at the top of the file).
+   ============================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Jost:wght@200;300;400&family=IBM+Plex+Mono:wght@300;400&display=swap');
+
+/* --- Tailwind v4 tokens ------------------------------------------------
+   Makes bg-surface / text-ink / ring-accent / font-mono available to
+   Tailwind. On Tailwind v3, delete this block and put the same colours in
+   theme.extend.colors in tailwind.config.js instead — the :root block
+   below is what the component classes actually use, so nothing breaks. */
+@theme {
+  --color-paper: #F1F4F5;
+  --color-surface: #FAFCFC;
+  --color-sunken: #E7ECEE;
+  --color-ink: #15181A;
+  --color-muted: #6B767D;
+  --color-label: #5E686E;
+  --color-faint: #9CA6AC;
+  --color-accent: #4E7C8C;
+  --color-ok: #4C7D69;
+  --color-warn: #9C8250;
+  --color-stop: #96635E;
+
+  --font-sans: 'Jost', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+
+  --radius-none: 0px;
+}
+
+:root {
+  --paper: #F1F4F5;
+  --surface: #FAFCFC;
+  --sunken: #E7ECEE;
+  --ink: #15181A;
+  --muted: #6B767D;
+  --label: #5E686E;
+  --faint: #9CA6AC;
+  --accent: #4E7C8C;
+  --ok: #4C7D69;
+  --warn: #9C8250;
+  --stop: #96635E;
+
+  --sans: 'Jost', ui-sans-serif, system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+}
+
+/* --- base ------------------------------------------------------------- */
+
+*,
+*::before,
+*::after { box-sizing: border-box; border-radius: 0; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 15px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tailwind's .hidden must always beat the component display rules below. */
+.hidden { display: none !important; }
+
+/* Focus is uniform across every interactive element. */
+:focus { outline: none; }
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* --- layout ----------------------------------------------------------- */
+
+.page {
+  display: flex;
+  justify-content: center;
+  padding: 40px 24px 80px;
+}
+
+.shell {
+  width: 100%;
+  max-width: 560px;
+}
+
+.stack-32 > * + * { margin-top: 32px; }
+.stack-20 > * + * { margin-top: 20px; }
+.stack-16 > * + * { margin-top: 16px; }
+.masthead { margin-bottom: 56px; }
+.section { margin-top: 32px; }
+
+/* --- type ------------------------------------------------------------- */
+
+.eyebrow,
+.label {
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 9px;
+  line-height: 1.4;
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  color: var(--label);
+}
+
+.eyebrow { letter-spacing: 0.3em; }
+.label--faint { color: var(--faint); }
+
+.display {
+  margin: 16px 0 0;
+  font-weight: 200;
+  font-size: 34px;
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.body {
+  margin: 12px 0 0;
+  max-width: 62ch;
+  color: var(--muted);
+}
+
+.ui { font-size: 13px; }
+
+.mono {
+  font-family: var(--mono);
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
+}
+
+.footnote {
+  margin: 32px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.link {
+  color: var(--ink);
+  text-decoration: none;
+  transition: color 150ms ease;
+}
+.link:hover { color: var(--accent); }
+
+/* --- panel ------------------------------------------------------------ */
+
+.panel {
+  background: var(--surface);
+  padding: 24px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+/* Live region — one per view, removed on a terminal state. */
+.is-live {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* --- status ----------------------------------------------------------- */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  color: var(--muted);
+}
+
+.status .dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.status--accent { color: var(--accent); }
+.status--ok     { color: var(--ok); }
+.status--warn   { color: var(--warn); }
+.status--stop   { color: var(--stop); }
+
+.status--accent .dot { animation: breathe 3.2s ease-in-out infinite; }
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.25; }
+  50%      { opacity: 0.9; }
+}
+
+/* --- field ------------------------------------------------------------ */
+
+.field-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 6px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  background: color-mix(in srgb, var(--sunken) 50%, transparent);
+  border: 0;
+  border-bottom: 1px solid var(--sunken);
+  padding: 10px 12px;
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+  transition: border-color 150ms ease;
+}
+
+.input:focus { border-bottom-color: var(--accent); }
+.input:disabled { color: var(--faint); }
+.input::placeholder { color: var(--faint); }
+
+.input--mono {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
+
+textarea.input { resize: none; }
+
+/* --- button ----------------------------------------------------------- */
+
+.btn {
+  display: inline-block;
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--accent);
+  padding: 11px 16px;
+  font-family: var(--sans);
+  font-weight: 300;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  color: var(--accent);
+  cursor: pointer;
+  transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.btn:hover { background: var(--accent); color: var(--surface); }
+
+.btn:disabled {
+  border-color: var(--sunken);
+  color: var(--faint);
+  background: transparent;
+  cursor: default;
+}
+
+.btn--ghost {
+  width: auto;
+  border-color: var(--sunken);
+  padding: 4px 10px;
+  font-size: 9px;
+  color: var(--ink);
+}
+
+.btn--ghost:hover { background: transparent; border-color: var(--accent); color: var(--accent); }
+
+/* --- warning ---------------------------------------------------------- */
+
+.warning {
+  border-left: 2px solid var(--warn);
+  padding: 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.warning--stop { border-left-color: var(--stop); }
+
+/* --- data ------------------------------------------------------------- */
+
+.data-block {
+  background: color-mix(in srgb, var(--sunken) 60%, transparent);
+  padding: 10px 12px;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-weight: 300;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  user-select: all;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-block:empty::before {
+  content: '—';
+  color: var(--faint);
+}
+
+/* --- motion ----------------------------------------------------------- */
+
+.reveal { animation: reveal 500ms ease both; }
+
+@keyframes reveal {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .status--accent .dot { opacity: 0.9; }
+}
+
+/* =============================================================
+   Additions for the invoice page
+   ============================================================= */
+
+/* --- choice list (token selection) ------------------------------------ */
+
+.choices {
+  display: block;
+  min-height: 132px; /* space reserved so the panel does not reflow on load */
+}
+
+.choice {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid var(--sunken);
+  padding: 10px 12px;
+  text-align: left;
+  font-family: var(--sans);
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.choice:last-child { border-bottom: 0; }
+.choice:hover { background: color-mix(in srgb, var(--sunken) 40%, transparent); }
+
+.choice.is-selected {
+  background: color-mix(in srgb, var(--sunken) 60%, transparent);
+  border-left-color: var(--accent);
+}
+
+.choice-main {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.choice-name {
+  font-weight: 300;
+  font-size: 13px;
+  color: var(--muted);
+  transition: color 150ms ease;
+}
+
+.choice.is-selected .choice-name { color: var(--ink); }
+
+.choice-detail {
+  font-family: var(--mono);
+  font-weight: 300;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.choice-id {
+  font-family: var(--mono);
+  font-weight: 300;
+  font-size: 11px;
+  color: var(--label);
+  white-space: nowrap;
+}
+
+/* --- data rows -------------------------------------------------------- */
+
+.rows { display: block; }
+
+.data-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--sunken);
+}
+
+.rows .data-row:last-child { border-bottom: 0; }
+
+.row-key {
+  font-family: var(--mono);
+  font-weight: 300;
+  font-size: 11px;
+  color: var(--label);
+}
+
+.row-value {
+  font-family: var(--mono);
+  font-weight: 300;
+  font-size: 12px;
+  color: var(--ink);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- empty state ------------------------------------------------------ */
+
+.empty {
+  margin: 0;
+  padding: 16px 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+/* --- panel footer ----------------------------------------------------- */
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 24px;
+}

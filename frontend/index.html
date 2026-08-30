@@ -3,138 +3,120 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Merchant Onboarding</title>
-  <link rel="stylesheet" href="./src/style.css" />
+  <link rel="stylesheet" href="src/styleTW.css" />
+  <title>Merchant Onboarding — Vestro</title>
 </head>
-<body class="bg-slate-900 text-slate-100 min-h-screen flex items-center justify-center p-4 antialiased">
+<body class="page">
 
-<div class="max-w-xl w-full bg-slate-800 rounded-2xl shadow-2xl border border-slate-700/80 p-8">
-  <!-- Header -->
-  <div class="mb-8 text-center">
-    <h1 class="text-3xl font-extrabold text-emerald-400 tracking-tight">Merchant Sign Up</h1>
-    <p class="text-slate-400 text-sm mt-2">Create your merchant account to access API key material and crypto indexing.</p>
-  </div>
+<main class="shell">
 
-  <!-- Error Alert Box -->
-  <div id="error-box" class="hidden mb-6 p-4 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 text-sm"></div>
+  <!-- Masthead -->
+  <header class="masthead">
+    <p class="eyebrow">Vestro / Onboarding</p>
+    <h1 class="display">Create a merchant account</h1>
+    <p class="body">You get an API key and a recovery phrase for address derivation. Both are shown once, on this page.</p>
+  </header>
 
-  <!-- Sign Up Form -->
-  <form id="merchant-form" class="space-y-5">
-    <!-- Merchant Name -->
-    <div>
-      <label for="name" class="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-1">Merchant Name *</label>
-      <input
-              type="text"
-              id="name"
-              required
-              placeholder="Acme Corp"
-              class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 transition-colors"
-      />
+  <!-- Form panel — carries the live ring while the request is in flight -->
+  <section class="panel" id="panel">
+    <div class="panel-head">
+      <span class="label">Account details</span>
+      <span class="status" id="status"><span class="dot"></span><span id="status-word">Open</span></span>
     </div>
 
-    <!-- Merchant Slug -->
-    <div>
-      <label for="slug" class="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-1">Slug *</label>
-      <input
-              type="text"
-              id="slug"
-              required
-              placeholder="acme-corp"
-              class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm font-mono focus:outline-none focus:border-emerald-500 transition-colors"
-      />
-    </div>
+    <!-- Error -->
+    <div id="error-box" class="warning warning--stop hidden"></div>
 
-    <!-- Password -->
-    <div>
-      <label for="password" class="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-1">Password *</label>
-      <input
-              type="password"
-              id="password"
-              required
-              placeholder="••••••••••••"
-              class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 transition-colors"
-      />
-    </div>
+    <form id="merchant-form" class="stack-20">
 
-    <!-- Webhook URL (Optional) -->
-    <div>
-      <label for="webhook_url" class="block text-xs font-semibold uppercase tracking-wider text-slate-300 mb-1">
-        Webhook URL <span class="text-slate-500 font-normal">(Optional)</span>
-      </label>
-      <input
-              type="url"
-              id="webhook_url"
-              placeholder="https://example.com/api/webhooks"
-              class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 transition-colors"
-      />
-    </div>
-
-    <!-- BIP39 Mnemonic (Optional) -->
-    <div>
-      <div class="flex justify-between items-center mb-1">
-        <label for="mnemonic" class="block text-xs font-semibold uppercase tracking-wider text-slate-300">
-          BIP39 Mnemonic <span class="text-slate-500 font-normal">(Optional)</span>
-        </label>
-        <button
-                type="button"
-                id="gen-mnemonic-btn"
-                class="text-xs text-emerald-400 hover:text-emerald-300 hover:underline cursor-pointer font-medium"
-        >
-          ⚡ Generate 12 Words
-        </button>
-      </div>
-      <textarea
-              id="mnemonic"
-              rows="2"
-              placeholder="Leave empty to let server auto-generate, or type 12 words..."
-              class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:outline-none focus:border-emerald-500 transition-colors resize-none"
-      ></textarea>
-    </div>
-
-    <!-- Submit Button -->
-    <button
-            type="submit"
-            id="submit-btn"
-            class="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-[0.98] text-slate-950 font-bold py-3 rounded-lg transition duration-200 shadow-lg cursor-pointer mt-2"
-    >
-      Create Merchant Account
-    </button>
-  </form>
-
-  <!-- Success Response Display -->
-  <div id="credentials-card" class="hidden mt-6 space-y-4 border-t border-slate-700 pt-6">
-    <div class="bg-amber-500/10 border border-amber-500/30 text-amber-300 p-4 rounded-lg text-xs leading-relaxed">
-      ⚠️ <strong>WARNING:</strong> Make sure to copy your secrets now. The API key secret, mnemonic, and webhook secret are <strong>only displayed once</strong>!
-    </div>
-
-    <div class="space-y-3 font-mono text-xs">
+      <!-- Merchant name -->
       <div>
-        <span class="text-slate-400 block text-[10px] uppercase">Merchant ID</span>
-        <div id="res-merchant-id" class="p-2 bg-slate-900 rounded border border-slate-800 text-slate-200 select-all"></div>
+        <div class="field-head">
+          <label class="label" for="name">Merchant name</label>
+        </div>
+        <input type="text" id="name" required placeholder="Acme Corp" class="input" autocomplete="organization" />
+      </div>
+
+      <!-- Slug -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="slug">Slug</label>
+        </div>
+        <input type="text" id="slug" required placeholder="acme-corp" class="input input--mono" autocomplete="off" spellcheck="false" />
+      </div>
+
+      <!-- Password -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="password">Password</label>
+        </div>
+        <input type="password" id="password" required placeholder="••••••••••••" class="input" autocomplete="new-password" />
+      </div>
+
+      <!-- Webhook URL -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="webhook_url">Webhook URL</label>
+          <span class="label label--faint">Optional</span>
+        </div>
+        <input type="url" id="webhook_url" placeholder="https://example.com/api/webhooks" class="input input--mono" autocomplete="off" spellcheck="false" />
+      </div>
+
+      <!-- Recovery phrase -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="mnemonic">Recovery phrase</label>
+          <button type="button" id="gen-mnemonic-btn" class="btn btn--ghost">Generate 12 words</button>
+        </div>
+        <textarea id="mnemonic" rows="2" placeholder="Leave empty and the server generates one" class="input input--mono" spellcheck="false"></textarea>
+      </div>
+
+      <button type="submit" id="submit-btn" class="btn">Create account</button>
+    </form>
+  </section>
+
+  <!-- Credentials -->
+  <section id="credentials-card" class="panel section hidden">
+    <div class="panel-head">
+      <span class="label">Credentials</span>
+      <span class="status status--warn"><span class="dot"></span>Copy once</span>
+    </div>
+
+    <div class="warning">
+      The API key secret, recovery phrase, and webhook secret are shown only here. Store them before you leave this page — they cannot be retrieved again.
+    </div>
+
+    <div class="stack-16" style="margin-top: 24px;">
+      <div>
+        <span class="label">Merchant ID</span>
+        <div id="res-merchant-id" class="data-block"></div>
       </div>
 
       <div>
-        <span class="text-slate-400 block text-[10px] uppercase">API Key ID</span>
-        <div id="res-api-key-id" class="p-2 bg-slate-900 rounded border border-slate-800 text-slate-200 select-all"></div>
+        <span class="label">API key ID</span>
+        <div id="res-api-key-id" class="data-block"></div>
       </div>
 
       <div>
-        <span class="text-emerald-400 block text-[10px] uppercase font-bold">API Key Secret (Save this!)</span>
-        <div id="res-api-key-secret" class="p-2 bg-slate-900 rounded border border-emerald-500/40 text-emerald-300 select-all font-semibold"></div>
+        <span class="label">API key secret</span>
+        <div id="res-api-key-secret" class="data-block"></div>
       </div>
 
       <div>
-        <span class="text-emerald-400 block text-[10px] uppercase font-bold">BIP39 Mnemonic</span>
-        <div id="res-mnemonic" class="p-2 bg-slate-900 rounded border border-emerald-500/40 text-emerald-300 select-all font-semibold break-words"></div>
+        <span class="label">Recovery phrase</span>
+        <div id="res-mnemonic" class="data-block"></div>
       </div>
 
       <div id="webhook-secret-container" class="hidden">
-        <span class="text-emerald-400 block text-[10px] uppercase font-bold">Webhook Secret</span>
-        <div id="res-webhook-secret" class="p-2 bg-slate-900 rounded border border-emerald-500/40 text-emerald-300 select-all font-semibold"></div>
+        <span class="label">Webhook secret</span>
+        <div id="res-webhook-secret" class="data-block"></div>
       </div>
     </div>
-  </div>
-</div>
+  </section>
+
+  <p class="footnote">Already registered? <a href="/dashboard" class="link">Go to the dashboard →</a></p>
+
+</main>
 
 <script type="module" src="/src/main.ts"></script>
 </body>

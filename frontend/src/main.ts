@@ -38,6 +38,11 @@ const genMnemonicBtn = document.querySelector<HTMLButtonElement>('#gen-mnemonic-
 const submitBtn = document.querySelector<HTMLButtonElement>('#submit-btn')!;
 const errorBox = document.querySelector<HTMLDivElement>('#error-box')!;
 
+// Panel + status line
+const panel = document.querySelector<HTMLElement>('#panel')!;
+const status = document.querySelector<HTMLElement>('#status')!;
+const statusWord = document.querySelector<HTMLElement>('#status-word')!;
+
 // Result UI
 const credentialsCard = document.querySelector<HTMLDivElement>('#credentials-card')!;
 const resMerchantId = document.querySelector<HTMLDivElement>('#res-merchant-id')!;
@@ -46,6 +51,26 @@ const resApiKeySecret = document.querySelector<HTMLDivElement>('#res-api-key-sec
 const resMnemonic = document.querySelector<HTMLDivElement>('#res-mnemonic')!;
 const webhookSecretContainer = document.querySelector<HTMLDivElement>('#webhook-secret-container')!;
 const resWebhookSecret = document.querySelector<HTMLDivElement>('#res-webhook-secret')!;
+
+// -----------------------------------------------------------------------------
+// Status vocabulary — one word per state, coloured by tone.
+// muted: open · accent: creating (live) · ok: created · stop: failed
+// -----------------------------------------------------------------------------
+type State = 'open' | 'creating' | 'created' | 'failed';
+
+const TONE: Record<State, string> = {
+  open: '',
+  creating: 'status--accent',
+  created: 'status--ok',
+  failed: 'status--stop',
+};
+
+function setState(next: State) {
+  status.className = `status ${TONE[next]}`.trim();
+  statusWord.textContent = next.charAt(0).toUpperCase() + next.slice(1);
+  // The live ring belongs to the element that is changing, and only while it changes.
+  panel.classList.toggle('is-live', next === 'creating');
+}
 
 // -----------------------------------------------------------------------------
 // Event Handlers
@@ -74,8 +99,10 @@ form.addEventListener('submit', async (e) => {
   errorBox.classList.add('hidden');
   errorBox.textContent = '';
   credentialsCard.classList.add('hidden');
+  credentialsCard.classList.remove('reveal');
   submitBtn.disabled = true;
-  submitBtn.textContent = 'Processing...';
+  submitBtn.textContent = 'Creating…';
+  setState('creating');
 
   // Construct payload
   const payload: SignUpMerchantRequest = {
@@ -115,13 +142,16 @@ form.addEventListener('submit', async (e) => {
 
     // Display credentials card and reset form
     credentialsCard.classList.remove('hidden');
+    credentialsCard.classList.add('reveal');
+    setState('created');
     form.reset();
 
   } catch (err) {
     errorBox.classList.remove('hidden');
-    errorBox.textContent = err instanceof Error ? err.message : 'An unknown error occurred.';
+    errorBox.textContent = err instanceof Error ? err.message : 'The account could not be created. Check the fields and try again.';
+    setState('failed');
   } finally {
     submitBtn.disabled = false;
-    submitBtn.textContent = 'Create Merchant Account';
+    submitBtn.textContent = 'Create account';
   }
 });

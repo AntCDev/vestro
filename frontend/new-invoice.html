@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Create Invoice — Vestro</title>
+</head>
+<body class="page">
+
+<main class="shell">
+
+  <!-- Masthead -->
+  <header class="masthead">
+    <p class="eyebrow">Vestro / Invoices</p>
+    <h1 class="display">Create an invoice</h1>
+    <p class="body">Pick a token and an amount. You get back an invoice ID and a hosted checkout URL to send to the payer.</p>
+  </header>
+
+  <!-- Form panel -->
+  <section class="panel" id="panel">
+    <div class="panel-head">
+      <span class="label">Invoice details</span>
+      <span class="status" id="status"><span class="dot"></span><span id="status-word">Open</span></span>
+    </div>
+
+    <div id="error-box" class="warning warning--stop hidden"></div>
+
+    <form id="invoice-form" class="stack-20">
+
+      <!-- Merchant -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="merchant_id">Merchant ID</label>
+        </div>
+        <input
+          type="text"
+          id="merchant_id"
+          required
+          placeholder="00000000-0000-0000-0000-000000000000"
+          class="input input--mono"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <!-- Token -->
+      <div>
+        <div class="field-head">
+          <span class="label">Token</span>
+          <span class="label label--faint" id="token-count"></span>
+        </div>
+
+        <div id="token-list" class="choices" role="radiogroup" aria-label="Token">
+          <p class="empty">Loading token handlers</p>
+        </div>
+
+        <div id="token-info" class="data-block hidden"></div>
+      </div>
+
+      <!-- Amount -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="amount">Amount</label>
+          <span class="label label--faint" id="amount-unit"></span>
+        </div>
+        <input
+          type="text"
+          id="amount"
+          required
+          inputmode="decimal"
+          placeholder="0.00"
+          class="input input--mono"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <!-- Reference -->
+      <div>
+        <div class="field-head">
+          <label class="label" for="data">Reference</label>
+          <span class="label label--faint">Optional</span>
+        </div>
+        <input
+          type="text"
+          id="data"
+          placeholder="Order #1042"
+          class="input"
+          autocomplete="off"
+        />
+      </div>
+
+      <button type="submit" id="submit-btn" class="btn">Create invoice</button>
+    </form>
+  </section>
+
+  <!-- Result -->
+  <section id="invoice-card" class="panel section hidden">
+    <div class="panel-head">
+      <span class="label">Invoice</span>
+      <span class="status status--ok"><span class="dot"></span>Created</span>
+    </div>
+
+    <div class="stack-16">
+      <div>
+        <span class="label">Invoice ID</span>
+        <div id="res-invoice-id" class="data-block"></div>
+      </div>
+
+      <div>
+        <span class="label">Checkout URL</span>
+        <div id="res-invoice-url" class="data-block"></div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" id="copy-url-btn" class="btn btn--ghost">Copy URL</button>
+      <a id="open-invoice-link" class="link ui" href="#" target="_blank" rel="noopener">Open checkout →</a>
+    </div>
+  </section>
+
+  <!-- Environment readout -->
+  <section class="panel section">
+    <div class="panel-head">
+      <span class="label">Environment</span>
+      <span class="status" id="env-status"><span class="dot"></span><span id="env-word">Loading</span></span>
+    </div>
+
+    <div class="rows">
+      <div class="data-row">
+        <span class="row-key">EVM chains</span>
+        <span class="row-value" id="env-evm"></span>
+      </div>
+      <div class="data-row">
+        <span class="row-key">Solana clusters</span>
+        <span class="row-value" id="env-sol"></span>
+      </div>
+      <div class="data-row">
+        <span class="row-key">Bitcoin networks</span>
+        <span class="row-value" id="env-btc"></span>
+      </div>
+      <div class="data-row">
+        <span class="row-key">Token handlers</span>
+        <span class="row-value" id="env-tokens"></span>
+      </div>
+    </div>
+  </section>
+
+  <p class="footnote">Need an account first? <a href="/index.html" class="link">Create a merchant →</a></p>
+
+</main>
+
+<script type="module" src="/src/new-invoice.ts"></script>
+</body>
+</html>

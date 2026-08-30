@@ -35,7 +35,6 @@ pub async fn create_invoice_handler(
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, (StatusCode, String)> {
 
-    // Pass implementation over to the orchestrator
     let invoice_id = state
         .orchestrator
         .create_invoice(
@@ -47,8 +46,14 @@ pub async fn create_invoice_handler(
         .await
         .map_err(|err_msg| (StatusCode::INTERNAL_SERVER_ERROR, err_msg))?;
 
-    // Assemble dynamic checkout URL
-    let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| {
+        let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+
+        let display_host = if host == "0.0.0.0" { "localhost" } else { &host };
+        format!("http://{}:{}", display_host, port)
+    });
+
     let invoice_url = format!("{}/invoice?id={}", base_url, invoice_id);
 
     Ok(Json(CreateInvoiceResponse {
@@ -56,7 +61,6 @@ pub async fn create_invoice_handler(
         invoice_id,
     }))
 }
-
 
 
 #[derive(Deserialize)]

@@ -1,6 +1,6 @@
 # Vestro (Early Alpha)
 
-> ⚠️ **Status: Early Alpha.** The core architecture is in place and the first major phase (invoice creation, payment observation across both payment paths, and webhook delivery) is complete — this project has graduated from proof-of-concept to early alpha. That said, large parts of the system (sweeping, ledgering, non-EVM networks) are still in progress or unimplemented, and nothing here has been audited. **Do not use this in production or with real funds.** See the [Roadmap & timeline](#roadmap--timeline) for exactly where things stand.
+> ⚠️ **Status: Early Alpha.** The core architecture is in place and the first major phase (invoice creation, payment observation across both payment paths, and webhook delivery) is complete — this project has graduated from proof-of-concept to early alpha. That said, large parts of the system (sweeping, ledgering) are still in progress or unimplemented, and nothing here has been audited. **Do not use this in production or with real funds.** See the [Roadmap & timeline](#roadmap--timeline) for exactly where things stand.
 
 > ⚠️ **This project is custodial by design.** The operator's server generates and holds the private keys / signing authority for every merchant wallet it creates. Merchants are able to export their own keys as a glass-break measure, which means custody is shared in practice — but the operator remains the custodian in the sense that matters legally, and remains responsible for any funds the system receives. See [`COMPLIANCE.md`](./COMPLIANCE.md) before deploying anywhere beyond your own local testing, and [`RECONCILIATION.md`](./RECONCILIATION.md) §10 for what shared custody means operationally.
 
@@ -49,16 +49,18 @@ It is also a learning project — a way to get hands-on with HD wallet derivatio
 
 The full path from "create an invoice" to "tell the merchant it was paid": an invoice can be created, its payment observed through either of the dual payment paths (naive QR or WalletConnect), the resulting events ingested, and the webhook delivered to the merchant's URL.
 
-- [x] Overall architecture: the network-agnostic orchestrator and the `NetworkClient` / `TokenHandler` traits
-- [x] Network and token registration system
-- [x] Network implementation — **EVM**, fully tested as the development network
-- [x] Webhook delivery (at-least-once, retried, transactional with state changes)
+* [x] Overall architecture: the network-agnostic orchestrator and the `NetworkClient` / `TokenHandler` traits
+* [x] Network and token registration system
+* [x] Network implementation — **EVM**, fully tested as the development network
+* [x] Webhook delivery (at-least-once, retried, transactional with state changes)
+
 ### 🚧 Phase 2 — Network expansion: Solana & Esplora *(in progress)*
 
 Before continuing into sweeping and ledgering, the observing layer is being extended to the two remaining planned networks. This confirms the `NetworkClient` / `TokenHandler` trait surface actually holds up across a non-EVM account model (Solana) and a UTXO model (Esplora) before more is built on top of it.
 
-- [ ] **Solana** network implementation — actively in progress, mostly done but not yet finished
-- [ ] **Esplora** (Bitcoin-style UTXO) network implementation — up next after Solana
+* [x] **Solana** network implementation — finished and fully tested
+* [ ] **Esplora** (Bitcoin-style UTXO) network implementation — implemented, currently untested and undocumented
+
 ### 🔜 Phase 3 — Sweeping & ledgering
 
 Moving funds from per-invoice deposit addresses to merchant main accounts, and accounting for every unit of value while doing it. The design sketch of the ledgering system is done — see [`LEDGER.md`](./LEDGER.md).

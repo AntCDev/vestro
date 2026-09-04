@@ -5,9 +5,8 @@
 > tables, constants and events involved, and calls out where behaviour is deliberate
 > versus where it is a known gap.
 >
-> **Status:** EVM and Solana are implemented and documented in full. Esplora is
-> specified here but **not yet implemented** — its section is a TODO describing the
-> intended shape, not the current code.
+>  **Status:** EVM and Solana are implemented and documented in full. Esplora is
+> implemented, but remains untested and undocumented.
 ---
 
 ## 1. Design principle: agnostic orchestrator, optimized paths

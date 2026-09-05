@@ -12,6 +12,7 @@ mod networks;
 mod tokens;
 mod api;
 mod orchestrator;
+mod assets;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,28 +58,25 @@ async fn main() {
     println!(" Done.");
 
     // 1. Instantiate the networks ONCE on load & spawn payment watchers
-    let networks = Arc::new(networks::NetworkRegistry::from_env(pool.clone()));
+    let networks = Arc::new(networks::NetworkRegistry::from_env());
 
     // 2. Pass the singletons down to the token registry so handlers can clone the Arcs
     let registry = Arc::new(tokens::TokenRegistry::new(networks.clone()));
-    registry
-        .sync_checkout_views(&pool)
-        .await
-        .expect("Failed to sync checkout views");
 
-
-    // 3. Instantiate Orchestrator and pass the required dependencies
     let orchestrator = Arc::new(orchestrator::PaymentOrchestrator::new(
         pool.clone(),
-        registry.clone()
+        registry.clone(),
     ));
 
-    let state = AppState {
-        pool,
-        networks,
-        registry,
-        orchestrator
-    };
+    // 3. Instantiate Orchestrator and pass the required dependencies
+    // Code is authoritative: overwrites the assets rows on every boot.
+    orchestrator.sync_assets().await.expect("Failed to sync assets");
+
+    // DB is authoritative: never overwrites an operator's view mapping.
+    registry.sync_checkout_views(&pool).await.expect("Failed to sync checkout views");
+    networks.spin_up_all(&pool);
+
+    let state = AppState { pool, networks, registry, orchestrator };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -86,7 +84,6 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/tokens", get(api::watcher::list_tokens_handler))
         .route("/api/invoices", post(api::invoices::create_invoice_handler))
         .route("/api/merchants", post(api::merchants::signup_merchant_handler))
         .route("/invoice", get(api::invoices::invoice_redirect_handler))
@@ -98,7 +95,6 @@ async fn main() {
         .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))
         .route("/api/test/networks", get(api::tests::list_networks_test_handler))
         .route("/api/test/merchants", get(api::tests::list_merchants_test_handler))
-        .route("/api/test/overview", get(api::tests::test_overview_handler))
 
         // Middleware
         .fallback_service(ServeDir::new("wwwroot"))

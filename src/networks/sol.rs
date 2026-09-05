@@ -243,7 +243,7 @@ fn parse_derivation_path(path: &str) -> Result<Vec<u32>, String> {
 /// The one network string. `invoices.network_type`, `merchant_wallets.network_type`,
 /// `merchant_network_indices.network` and `network_address_cursors.network_type`
 /// all use it. Never 'sol', never 'SOL'.
-const NETWORK_TYPE: &str = "solana";
+pub const NETWORK_TYPE: &str = crate::assets::NETWORK_SOLANA;
 
 const POLL_INTERVAL_SECS: u64 = 2;
 const SIG_PAGE_LIMIT: usize = 1000;
@@ -2392,6 +2392,17 @@ fn i128_to_decimal(v: i128) -> Result<Decimal, String> {
 }
 #[async_trait]
 impl NetworkClient for SolanaNetwork {
+    fn network_type(&self) -> &'static str {
+        NETWORK_TYPE
+    }
+
+    fn chain_ref(&self) -> String {
+        match self.cluster {
+            SolanaCluster::MainnetBeta => "mainnet-beta".to_string(),
+            SolanaCluster::Testnet => "testnet".to_string(),
+            SolanaCluster::Devnet => "devnet".to_string(),
+        }
+    }
     // --- WALLET METHODS ---
     async fn get_derive_address(
         &self,

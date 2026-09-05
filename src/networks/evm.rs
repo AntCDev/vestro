@@ -2244,6 +2244,13 @@ impl EVMNetwork {
 
 #[async_trait]
 impl NetworkClient for EVMNetwork {
+    fn network_type(&self) -> &'static str {
+        crate::assets::NETWORK_EVM
+    }
+
+    fn chain_ref(&self) -> String {
+        self.chain_id.to_string()
+    }
     async fn get_derive_address(
         &self,
         pool: &PgPool,

@@ -1510,6 +1510,17 @@ fn base58check_decode(s: &str) -> Option<Vec<u8>> {
 
 #[async_trait]
 impl NetworkClient for EsploraNetwork {
+    fn network_type(&self) -> &'static str {
+        crate::assets::NETWORK_ESPLORA
+    }
+
+    fn chain_ref(&self) -> String {
+        match self.network {
+            BitcoinNetwork::Mainnet => "mainnet".to_string(),
+            BitcoinNetwork::Testnet4 => "testnet4".to_string(),
+            BitcoinNetwork::Signet => "signet".to_string(),
+        }
+    }
     async fn get_derive_address(
         &self,
         pool: &PgPool,

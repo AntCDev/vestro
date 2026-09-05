@@ -1,20 +1,30 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 use uuid::Uuid;
-
-use crate::{tokens::TokenMetadata, AppState};
-
+use crate::AppState;
+use crate::tokens::TokenSummary;
 // ==========================================
 // 1. TOKENS ENDPOINT
 // ==========================================
 
 /// GET /api/test/tokens
 /// Returns all metadata for currently registered token handlers in the system.
-pub async fn list_tokens_test_handler(
-    State(state): State<AppState>,
-) -> Json<Vec<TokenMetadata>> {
-    let tokens = state.registry.get_metadata();
-    Json(tokens)
+// pub async fn list_tokens_test_handler(
+//     State(state): State<AppState>,
+// ) -> Json<Vec<TokenMetadata>> {
+//     let tokens = state.registry.get_metadata();
+//     Json(tokens)
+// }
+
+pub async fn list_tokens_test_handler(State(state): State<AppState>) -> Json<Vec<TokenSummary>> {
+    Json(
+        state
+            .registry
+            .summaries()
+            .into_iter()
+            .filter(|s| s.capabilities.invoice)
+            .collect(),
+    )
 }
 
 // ==========================================
@@ -85,53 +95,4 @@ pub async fn list_merchants_test_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list merchants: {e}")))?;
 
     Ok(Json(merchants))
-}
-
-// ==========================================
-// 4. COMBINED SYSTEM OVERVIEW (BONUS)
-// ==========================================
-
-#[derive(Serialize)]
-pub struct SystemTestOverview {
-    pub tokens: Vec<TokenMetadata>,
-    pub networks: NetworkSummaryResponse,
-    pub total_merchants: i64,
-}
-
-/// GET /api/test/overview
-/// Single aggregator payload for inspecting overall application state.
-pub async fn test_overview_handler(
-    State(state): State<AppState>,
-) -> Result<Json<SystemTestOverview>, (StatusCode, String)> {
-    let tokens = state.registry.get_metadata();
-
-    let networks = NetworkSummaryResponse {
-        evm_chain_ids: state.networks.evm.keys().copied().collect(),
-        solana_clusters: state
-            .networks
-            .sol
-            .keys()
-            .map(|c| format!("{:?}", c))
-            .collect(),
-        bitcoin_networks: state
-            .networks
-            .esplora
-            .keys()
-            .map(|n| format!("{:?}", n))
-            .collect(),
-    };
-
-    let total_merchants = sqlx::query_scalar!(
-        r#"SELECT COUNT(*) FROM merchants"#
-    )
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB query failed: {e}")))?
-        .unwrap_or(0);
-
-    Ok(Json(SystemTestOverview {
-        tokens,
-        networks,
-        total_merchants,
-    }))
 }

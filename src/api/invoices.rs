@@ -170,6 +170,7 @@ pub struct CheckoutResponse {
     /// Opaque, handler-defined. The assigned view file is expected to know
     /// this shape; the API makes no guarantees about it.
     pub data: Value,
+    pub token: CheckoutToken,
 }
 
 #[derive(Serialize)]
@@ -198,6 +199,20 @@ pub struct CheckoutViewInfo {
 }
 
 /// GET /api/invoices/:id/checkout   (called once, on page load)
+/// Extra advertised facts the checkout page can now use directly instead of
+/// sniffing them out of the handler-defined `data` blob: badge a testnet,
+/// show a "work in progress" ribbon, pick an explorer by network+chain.
+#[derive(Serialize)]
+pub struct CheckoutToken {
+    pub id: String,
+    pub name: String,
+    pub detail: String,
+    pub network: String,
+    pub chain: String,
+    pub testnet: bool,
+    pub status: String,
+}
+
 pub async fn get_invoice_checkout_handler(
     State(state): State<AppState>,
     Path(invoice_id): Path<Uuid>,
@@ -218,16 +233,25 @@ pub async fn get_invoice_checkout_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "invoice not found".to_string()))?;
 
-    let handler = state
-        .registry
-        .get_handler(&inv.token_id)
-        .ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("no handler registered for token {}", inv.token_id),
-        ))?;
+    let handler = state.registry.get_handler(&inv.token_id).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("no handler registered for token {}", inv.token_id),
+    ))?;
 
-    // DB is authoritative; fall back to the handler's compiled default if the
-    // mapping row is missing (token registered after the last sync, etc).
+    // CHANGED: the invoice exists, so this token could invoice when the row was
+    // created. Losing the capability since then is an operator/deploy problem,
+    // not a payer problem — but there is genuinely no page to render, so say so
+    // plainly rather than serving a checkout that cannot be completed.
+    let invoicer = handler.invoicer().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!(
+            "token {} no longer supports invoicing; invoice {} cannot be displayed",
+            inv.token_id, invoice_id
+        ),
+    ))?;
+
+    // DB is authoritative; fall back to the compiled default if the mapping row
+    // is missing (token registered after the last sync, etc).
     let view = sqlx::query_as::<_, (String, String)>(
         r#"
         SELECT cv.id, cv.path
@@ -242,8 +266,12 @@ pub async fn get_invoice_checkout_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(|(id, path)| CheckoutViewInfo { id, path })
         .unwrap_or_else(|| {
-            let v = handler.checkout_view();
-            CheckoutViewInfo { id: v.id.to_string(), path: v.path.to_string() }
+            // CHANGED: checkout_view() moved to Invoicer.
+            let v = invoicer.checkout_view();
+            CheckoutViewInfo {
+                id: v.id.to_string(),
+                path: v.path.to_string(),
+            }
         });
 
     let ctx = CheckoutContext {
@@ -266,24 +294,32 @@ pub async fn get_invoice_checkout_handler(
         data: inv.data.clone(),
     };
 
-    let data = handler
+    // CHANGED: checkout_data() moved to Invoicer.
+    let data = invoicer
         .checkout_data(&state.pool, &ctx)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let meta = state
-        .registry
-        .get_metadata()
-        .into_iter()
-        .find(|m| m.id == inv.token_id);
+    // CHANGED: was a linear scan of get_metadata() to find this token's name
+    // and detail. We already hold the handler, so ask it directly.
+    let d = handler.descriptor();
+    let token = CheckoutToken {
+        id: d.id.clone(),
+        name: d.name.clone(),
+        detail: d.detail.clone(),
+        network: d.network.clone(),
+        chain: d.chain.clone(),
+        testnet: d.testnet,
+        status: d.status.as_str().to_string(),
+    };
 
     Ok(Json(CheckoutResponse {
         invoice: CheckoutInvoice {
             id: invoice_id,
             merchant_id: inv.merchant_id,
             token_id: inv.token_id,
-            token_name: meta.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
-            token_detail: meta.map(|m| m.detail).unwrap_or_default(),
+            token_name: token.name.clone(),
+            token_detail: token.detail.clone(),
             token_decimals: inv.token_decimals,
             amount_requested: inv.amount_requested.to_string(),
             amount_received: inv.amount_received.to_string(),
@@ -294,6 +330,9 @@ pub async fn get_invoice_checkout_handler(
             created_at: inv.created_at,
             expires_at: inv.expires_at,
         },
+        // NEW field on CheckoutResponse. token_name / token_detail stay where
+        // they are so the existing checkout pages keep working.
+        token,
         view,
         data,
     }))
@@ -335,25 +374,28 @@ pub async fn get_invoice_status_handler(
     // A failing status hook must not break polling — the generic half of this
     // response is what actually drives the "paid" transition in the UI.
     let data = match state.registry.get_handler(&inv.token_id) {
-        Some(handler) => {
-            let ctx = StatusContext {
-                invoice_id,
-                token_id: inv.token_id.clone(),
-                wallet_address: inv.wallet_address.clone(),
-                payment_reference: inv.payment_reference.clone(),
-                status: inv.status.clone(),
-                amount_requested: inv.amount_requested,
-                amount_received: inv.amount_received,
-                expires_at: inv.expires_at,
-            };
-            handler
-                .status_data(&state.pool, &ctx)
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("⚠️  status_data failed for {}: {}", inv.token_id, e);
-                    Value::Null
-                })
-        }
+        Some(handler) => match handler.invoicer() {
+            Some(invoicer) => {
+                let ctx = StatusContext {
+                    invoice_id,
+                    token_id: inv.token_id.clone(),
+                    wallet_address: inv.wallet_address.clone(),
+                    payment_reference: inv.payment_reference.clone(),
+                    status: inv.status.clone(),
+                    amount_requested: inv.amount_requested,
+                    amount_received: inv.amount_received,
+                    expires_at: inv.expires_at,
+                };
+                invoicer
+                    .status_data(&state.pool, &ctx)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("⚠️  status_data failed for {}: {}", inv.token_id, e);
+                        Value::Null
+                    })
+            }
+            None => Value::Null,
+        },
         None => Value::Null,
     };
 
@@ -415,6 +457,14 @@ pub async fn get_invoice_blockhash_handler(
         format!("no handler registered for token {}", inv.token_id),
     ))?;
 
+    // CHANGED. "No invoicer" and "invoicer with no pre-sign step" are different
+    // failures — one is a misconfigured deployment, the other is a normal fact
+    // about the token — so they get different codes.
+    let invoicer = handler.invoicer().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("token {} no longer supports invoicing", inv.token_id),
+    ))?;
+
     let ctx = PresignContext {
         invoice_id,
         token_id: inv.token_id.clone(),
@@ -422,7 +472,7 @@ pub async fn get_invoice_blockhash_handler(
         expires_at: inv.expires_at,
     };
 
-    let data = handler
+    let data = invoicer
         .presign_data(&state.pool, &ctx)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;

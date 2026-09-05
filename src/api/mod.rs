@@ -4,6 +4,5 @@ use serde::Serialize;
 use async_trait::async_trait;
 
 pub mod invoices;
-pub mod watcher;
 pub mod merchants;
 pub mod tests;

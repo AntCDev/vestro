@@ -181,7 +181,7 @@ impl Invoicer for BaseSepoliaHandler {
             expires_at,
             payment_reference,
             self.config.required_confirmations as i16,
-            created_block,
+            (created_block - 2).max(0),
             invoice_id
         )
         .execute(pool)

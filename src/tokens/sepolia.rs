@@ -164,7 +164,11 @@ impl Invoicer for SepoliaHandler {
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 
         let expires_at = Utc::now() + Duration::minutes(30);
-
+        let created_block = self
+            .network
+            .get_current_block()
+            .await
+            .map_err(|e| format!("Failed to fetch current block: {e}"))? as i64;
         // network_type / chain_ref / token_address / token_decimals are already
         // on the row, written by the orchestrator from the advertised asset.
         // Note this is now the *canonical lowercase* token address — see
@@ -177,14 +181,16 @@ impl Invoicer for SepoliaHandler {
                 expires_at = $3,
                 payment_reference = $4,
                 required_confirmations = $5,
+                created_block = $6,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $6
+            WHERE id = $7
             "#,
             deposit_address,
             derived_wallet_index as i32,
             expires_at,
             payment_reference,
             self.config.required_confirmations as i16,
+            created_block,
             invoice_id
         )
             .execute(pool)

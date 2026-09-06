@@ -348,7 +348,7 @@ impl EVMNetwork {
         assert!(!rpc_urls.is_empty(), "EVMNetwork requires at least one RPC URL");
         Self {
             chain_id,
-            network_name: format!("EVM_{}", chain_id),
+            network_name: crate::assets::NETWORK_EVM.to_string(),
             display_name: display_name.to_string(),
             rpc_urls,
             contract_address,
@@ -2281,6 +2281,10 @@ impl NetworkClient for EVMNetwork {
         let reference = format!("0x{}", hex::encode(invoice_id.as_bytes()));
 
         Ok((address, index, Some(reference)))
+    }
+
+    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+        derive_evm_address(mnemonic, index)
     }
 
     fn validate_address(&self, address: &str) -> bool {

@@ -63,16 +63,53 @@ pub struct NetworkRegistry {
 }
 
 impl NetworkRegistry {
+
+    /// One client per *configured* family (evm/solana/esplora), used for
+    /// address derivation where any chain in the family yields the same
+    /// address format. Families with zero configured networks are omitted.
+    pub fn representative_clients(&self) -> Vec<Arc<dyn NetworkClient>> {
+        let mut out: Vec<Arc<dyn NetworkClient>> = Vec::new();
+        if let Some(net) = self.evm.values().next() {
+            out.push(net.clone() as Arc<dyn NetworkClient>);
+        }
+        if let Some(net) = self.sol.values().next() {
+            out.push(net.clone() as Arc<dyn NetworkClient>);
+        }
+        if let Some(net) = self.esplora.values().next() {
+            out.push(net.clone() as Arc<dyn NetworkClient>);
+        }
+        out
+    }    
     pub fn from_env() -> Self {
         println!("\n🌐 Initializing Network Registry...");
 
         fn fetch_and_log_urls(name: &str, key: &str) -> Option<Vec<String>> {
-            // …unchanged…
-            unimplemented!()
+            let urls: Vec<String> = match std::env::var(key) {
+                Ok(raw) => raw
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+
+            if urls.is_empty() {
+                println!("  {} Network ❌ No valid RPC_URL found", name);
+                None
+            } else {
+                let count = urls.len();
+                let redundancy = if count > 1 { ", enabling redundancy" } else { "" };
+                println!("  {} Network ✅ {} RPC_URL Found{}", name, count, redundancy);
+                Some(urls)
+            }
         }
+
+        // Helper to fetch single optional strings (like contract addresses)
         fn fetch_optional_env(key: &str) -> Option<String> {
-            // …unchanged…
-            unimplemented!()
+            std::env::var(key)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         }
 
         // ---- EVM ----
@@ -202,6 +239,9 @@ pub trait NetworkClient: Send + Sync {
     /// "mainnet", "testnet4". A String, not an enum or an integer, precisely
     /// so an EVM chain id and a Solana cluster name share one column.
     fn chain_ref(&self) -> String;
+
+    /// Pure key derivation — no I/O. Used both at signup and during backfill.
+    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String>;
 
     async fn get_derive_address(
         &self,

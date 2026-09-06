@@ -500,7 +500,7 @@ pub struct SolanaNetwork {
 impl SolanaNetwork {
     pub fn new(cluster: SolanaCluster, rpc_urls: Vec<String>) -> Self {
         assert!(!rpc_urls.is_empty(), "SolanaNetwork requires at least one RPC URL");
-        let network_name = format!("SOL_{:?}", cluster);
+        let network_name = crate::assets::NETWORK_SOLANA.to_string();
 
         Self {
             cluster,
@@ -2475,7 +2475,9 @@ impl NetworkClient for SolanaNetwork {
 
         Ok((deposit_address, index, Some(owner_address)))
     }
-
+    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+        derive_solana_address(mnemonic, index)
+    }
     fn validate_address(&self, address: &str) -> bool {
         todo!()
     }

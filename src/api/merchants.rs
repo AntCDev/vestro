@@ -123,10 +123,24 @@ pub async fn signup_merchant_handler(
         }
     };
 
-    // 3. Derive EVM Wallet Address (Index 0)
-    let evm_address = derive_evm_address(&mnemonic_phrase, 0)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to derive EVM wallet: {e}")))?;
+    // 3. Derive one wallet address per *configured* network family
+    let mut derived_wallets: Vec<(&'static str, String)> = Vec::new();
+    for client in state.networks.representative_clients() {
+        let mut address = client
+            .derive_wallet_address(&mnemonic_phrase, 0)
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to derive {} wallet: {e}", client.network_type()),
+            ))?;
 
+        // EVM addresses are checksum-cased; store canonically lowercase.
+        // Solana/Bitcoin addresses are case-sensitive — never lowercase them.
+        if client.network_type() == "evm" {
+            address = address.to_lowercase();
+        }
+
+        derived_wallets.push((client.network_type(), address));
+    }
     // 4. Hash password with Argon2id & API Secret with SHA-256
     let password_hash = hash_password(&payload.password)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -193,22 +207,21 @@ pub async fn signup_merchant_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed key material insertion: {e}")))?;
 
-    // Insert EVM Wallet Address into merchant_wallets table
-    sqlx::query!(
-        r#"
-        INSERT INTO merchant_wallets (merchant_id, network_type, address)
-        VALUES ($1, $2, $3)
-        "#,
-        merchant_id,
-        "evm",
-        evm_address.to_lowercase()
-    )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed EVM wallet insertion: {e}")))?;
+    // Insert one wallet + one network-index row per configured family
+    for (network_type, address) in &derived_wallets {
+        sqlx::query!(
+            r#"
+            INSERT INTO merchant_wallets (merchant_id, network_type, address)
+            VALUES ($1, $2, $3)
+            "#,
+            merchant_id,
+            network_type,
+            address
+        )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed {network_type} wallet insertion: {e}")))?;
 
-    let default_networks = vec!["EVM", "SOL", "ESPLORA"];
-    for net in default_networks {
         sqlx::query!(
             r#"
             INSERT INTO merchant_network_indices (
@@ -217,11 +230,11 @@ pub async fn signup_merchant_handler(
             VALUES ($1, $2, 0, 0)
             "#,
             merchant_id,
-            net
+            network_type
         )
             .execute(&mut *tx)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed network indices insertion: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed {network_type} index insertion: {e}")))?;
     }
 
     tx.commit().await.map_err(|e| {

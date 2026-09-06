@@ -221,8 +221,7 @@ async function loadNetworks() {
 // Submission
 // -----------------------------------------------------------------------------
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DECIMAL = /^\d+(\.\d+)?$/;
-
+const INTEGER = /^[1-9]\d*$/;
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   clearError();
@@ -239,16 +238,17 @@ form.addEventListener('submit', async (e) => {
   }
 
   const rawAmount = amountInput.value.trim();
-  const parsedAmount = Number(rawAmount);
-  if (!DECIMAL.test(rawAmount) || parsedAmount <= 0) {
-    showError('Amount must be a positive decimal, for example 12.50.');
+
+  // Validate integer format and ensure it's greater than 0
+  if (!INTEGER.test(rawAmount)) {
+    showError('Amount must be a positive whole integer in atomic units (e.g., 1000000 for 1 USDC).');
     return;
   }
 
   const payload: CreateInvoiceRequest = {
     merchant_id: merchantId,
     token_id: selectedTokenId,
-    amount_requested: AMOUNT_AS_STRING ? rawAmount : parsedAmount,
+    amount_requested: AMOUNT_AS_STRING ? rawAmount : Number(rawAmount),
     data: dataInput.value.trim() || undefined,
   };
 

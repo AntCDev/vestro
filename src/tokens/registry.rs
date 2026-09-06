@@ -28,9 +28,9 @@ impl TokenRegistry {
             by_asset: HashMap::new(),
         };
 
-        crate::tokens::eth::register(&mut registry, networks.clone());
-        crate::tokens::sepolia::register(&mut registry, networks.clone());
-        crate::tokens::base::register(&mut registry, networks.clone());
+        // crate::tokens::eth::register(&mut registry, networks.clone());
+        // crate::tokens::sepolia::register(&mut registry, networks.clone());
+        // crate::tokens::base::register(&mut registry, networks.clone());
         crate::tokens::base_sepolia::register(&mut registry, networks.clone());
         crate::tokens::sol_devnet::register(&mut registry, networks.clone());
 

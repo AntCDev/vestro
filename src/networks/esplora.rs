@@ -1553,6 +1553,10 @@ impl NetworkClient for EsploraNetwork {
         Ok((address, index, None))
     }
 
+    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
+        self.derive_address(mnemonic, index)
+    }
+
     fn validate_address(&self, address: &str) -> bool {
         let trimmed = address.trim();
         if trimmed.is_empty() || trimmed.len() > 100 {

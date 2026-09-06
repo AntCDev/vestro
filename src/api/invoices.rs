@@ -9,6 +9,7 @@ use axum::{
     response::Redirect,
     Json,
 };
+use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -32,6 +33,7 @@ pub struct CreateInvoiceResponse {
 /// Accepts payload and delegates execution to the orchestrator layer
 pub async fn create_invoice_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateInvoiceRequest>,
 ) -> Result<Json<CreateInvoiceResponse>, (StatusCode, String)> {
 
@@ -46,13 +48,18 @@ pub async fn create_invoice_handler(
         .await
         .map_err(|err_msg| (StatusCode::INTERNAL_SERVER_ERROR, err_msg))?;
 
-    let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| {
-        let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
 
-        let display_host = if host == "0.0.0.0" { "localhost" } else { &host };
-        format!("http://{}:{}", display_host, port)
-    });
+    let base_url = std::env::var("BASE_URL")
+        .unwrap_or_else(|_| format!("{}://{}", proto, host));
 
     let invoice_url = format!("{}/invoice?id={}", base_url, invoice_id);
 

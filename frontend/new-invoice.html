@@ -64,14 +64,15 @@
           <span class="label label--faint" id="amount-unit"></span>
         </div>
         <input
-          type="text"
-          id="amount"
-          required
-          inputmode="decimal"
-          placeholder="0.00"
-          class="input input--mono"
-          autocomplete="off"
-          spellcheck="false"
+                type="text"
+                id="amount"
+                required
+                inputmode="numeric"
+                pattern="[0-9]*"
+                placeholder="0 (With Decimals, e.g. 1000000)"
+                class="input input--mono"
+                autocomplete="off"
+                spellcheck="false"
         />
       </div>
 

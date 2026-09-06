@@ -9,7 +9,7 @@ const REOWN_PROJECT_ID = import.meta.env.VITE_REOWN_PROJECT_ID || '';
 
 /** Shown inside the wallet's approval sheet. Must match the deployed origin. */
 const APP_METADATA = {
-  name: 'rust-crypto',
+  name: 'vestro',
   description: 'Invoice payment',
   url: window.location.origin, // must match the origin the page is served from
   icons: ['TODO_ABSOLUTE_URL_TO_ICON_PNG'],

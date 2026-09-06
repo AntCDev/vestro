@@ -11,7 +11,7 @@ use crate::networks::evm::EVMNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView};
 use crate::tokens::crypto::load_merchant_mnemonic;
-use crate::tokens::evm_common::evm_checkout_data;
+use crate::tokens::evm_common::{evm_checkout_data, TokenConfig};
 use crate::tokens::handler::{TokenDescriptor, TokenHandler};
 use crate::tokens::invoicer::{Invoicer, PaymentDetails};
 use crate::tokens::registry::TokenRegistry;
@@ -21,17 +21,6 @@ const CHAIN_ID: u64 = 84532;
 const BLOCK_EXPLORER: &str = "https://sepolia.basescan.org";
 #[allow(dead_code)]
 const CHAIN_NAME: &str = "Base Sepolia";
-
-#[derive(Debug, Clone)]
-pub struct TokenConfig {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub detail: &'static str,
-    pub info: &'static str,
-    pub token_address: Option<&'static str>, // None for native ETH
-    pub decimals: u8,
-    pub required_confirmations: i32,
-}
 
 pub const BASE_SEPOLIA_TOKENS: &[TokenConfig] = &[
     TokenConfig {

@@ -4,8 +4,17 @@ use sqlx::PgPool;
 
 use crate::networks::evm::EVMNetwork;
 use crate::tokens::{CheckoutContext};
-use crate::tokens::base_sepolia::TokenConfig;
 
+#[derive(Debug, Clone)]
+pub struct TokenConfig {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub detail: &'static str,
+    pub info: &'static str,
+    pub token_address: Option<&'static str>, // None for native ETH
+    pub decimals: u8,
+    pub required_confirmations: i32,
+}
 /// Shared checkout payload for every EVM handler (eth, base, polygon,
 /// sepolia, base_sepolia). Everything that varies is already in
 /// `network` + `config`, so per-chain handlers delegate here in one line.

@@ -24,7 +24,7 @@ mod sol_common;
 pub mod base_sepolia;
 // pub mod bitcoin;
 // pub mod eth;
-// pub mod sepolia;
+pub mod sepolia;
 pub mod sol_devnet;
 
 pub use checkout::{CheckoutContext, CheckoutView, PresignContext, StatusContext, GENERIC_VIEW};

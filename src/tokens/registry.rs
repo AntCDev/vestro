@@ -29,7 +29,7 @@ impl TokenRegistry {
         };
 
         // crate::tokens::eth::register(&mut registry, networks.clone());
-        // crate::tokens::sepolia::register(&mut registry, networks.clone());
+        crate::tokens::sepolia::register(&mut registry, networks.clone());
         // crate::tokens::base::register(&mut registry, networks.clone());
         crate::tokens::base_sepolia::register(&mut registry, networks.clone());
         crate::tokens::sol_devnet::register(&mut registry, networks.clone());

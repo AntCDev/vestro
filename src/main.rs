@@ -13,6 +13,7 @@ mod tokens;
 mod api;
 mod orchestrator;
 mod assets;
+mod ledgerer;
 
 #[derive(Clone)]
 pub struct AppState {

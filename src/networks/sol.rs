@@ -24,6 +24,14 @@ use futures::stream::{self, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::RwLock;
 
+use chrono::DateTime;
+use sqlx::Row;
+use crate::ledgerer::{
+    AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
+    ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
+};
+
+
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
 // ==========================================
@@ -344,12 +352,15 @@ impl ConfirmLevel {
 struct WatchedInvoice {
     invoice_id: Uuid,
     merchant_id: Uuid,
+    /// Route the invoice was created with. Recorded on the movement and used
+    /// for fee-rate resolution at recognition. Never an identity (LEDGER.md §1.1).
+    token_id: String,
     /// Naive-path target. Native: the HD-derived pubkey. SPL: that pubkey's ATA
     /// for `mint`, which is what the payer's wallet will build on its side.
     deposit_address: String,
     /// Smart-path key: the HD-derived pubkey, attached read-only. For a native
     /// invoice this is byte-identical to `deposit_address`; that is intentional
-    /// and every place it matters is handled explicitly below.
+    /// and every place it matters is handled explicitly.
     payment_reference: String,
     /// Smart-path credit target: merchant main wallet (native) or that wallet's
     /// ATA for `mint` (SPL). Empty => reference path disabled for this invoice.
@@ -360,6 +371,7 @@ struct WatchedInvoice {
     level: ConfirmLevel,
     created_slot: Option<i64>,
 }
+
 
 impl WatchedInvoice {
     /// Address feeds that can carry money for this invoice, deduped.
@@ -415,7 +427,23 @@ impl<'a> WatchIndex<'a> {
             by_id.insert(inv.invoice_id, inv);
 
             if !inv.deposit_address.is_empty() {
-                by_deposit.entry(inv.deposit_address.as_str()).or_default().push(inv);
+                let bucket = by_deposit.entry(inv.deposit_address.as_str()).or_default();
+                // Two live invoices on one deposit address with the same mint
+                // means the same base units would be credited twice. The ledger
+                // catches it (second movement collides on (tx_id, event_index),
+                // its recognition fails with NoMovementForPayment) but it
+                // should never be reachable if HD indices aren't reused.
+                if let Some(dup) = bucket.iter().find(|o| o.mint == inv.mint) {
+                    eprintln!(
+                        "watch index: invoices {} and {} share deposit address {} for mint {} — \
+                         HD index reuse? only one can be credited per tx",
+                        dup.invoice_id,
+                        inv.invoice_id,
+                        inv.deposit_address,
+                        inv.mint.as_deref().unwrap_or("SOL")
+                    );
+                }
+                bucket.push(inv);
             }
             // No merchant_target means the reference path is dead for this
             // invoice, so it never belongs in the reference index.
@@ -428,17 +456,41 @@ impl<'a> WatchIndex<'a> {
     }
 }
 
+
+
+/// One attributed credit inside one transaction. Everything the payments
+/// insert and the chain_movements row need, resolved once by `classify`.
+struct Credit<'a> {
+    inv: &'a WatchedInvoice,
+    amount: Decimal,
+    path: &'static str, // "direct" | "reference"
+    /// The account that was credited: deposit_address or merchant_target.
+    to_address: &'a str,
+    /// Its position in `tx.account_keys`. Feeds `event_index`.
+    account_index: i32,
+}
+
 /// A fetched transaction reduced to balance movements.
 ///
 /// Deltas rather than parsed instructions: a payer can move tokens with
 /// `transfer`, `transferChecked`, a CPI from an aggregator, or several
 /// instructions at once. Pre/post balances cover all of them and can't be
 /// spoofed by instruction shape.
+
+
 struct TxView {
     signature: String,
     slot: i64,
+    /// `getTransaction`'s `blockTime`. None on pruned history; recognition
+    /// then falls back to now() and records `occurred_at_exact = false`.
+    block_time: Option<i64>,
     failed: bool,
-    account_keys: HashSet<String>,
+    /// ORDERED exactly as the message names them: static keys, then
+    /// `loadedAddresses.writable`, then `loadedAddresses.readonly`. With
+    /// jsonParsed encoding `accountKeys` already arrives in this order. It is
+    /// the index space `pre/postBalances` and `tokenBalances[].accountIndex`
+    /// use, and what `chain_movements.event_index` is derived from.
+    account_keys: Vec<String>,
     /// Keys that signed. A Solana Pay `reference` is always read-only and
     /// non-signing, so this is what separates "a payer referenced our HD key"
     /// from "we swept our own HD key into the merchant wallet".
@@ -465,7 +517,35 @@ impl TxView {
             Some(m) => self.token_credit(address, m),
         }
     }
+
+    /// Position in the message's account list. Stable across replays of the
+    /// same signature, which is all `event_index` needs from it.
+    fn account_index(&self, key: &str) -> Option<i32> {
+        self.account_keys.iter().position(|k| k == key).map(|i| i as i32)
+    }
+
+    /// Best-effort counterparty: the account that lost the most of `mint`.
+    /// Informational only — it becomes `chain_movements.from_address`, which
+    /// is nullable and never a key. For SPL this is the source TOKEN account,
+    /// not its owner, because that is what the balance deltas name.
+    fn debit_source(&self, mint: Option<&str>) -> Option<String> {
+        match mint {
+            None => self
+                .native_delta
+                .iter()
+                .filter(|(_, d)| **d < 0)
+                .min_by_key(|(_, d)| **d)
+                .map(|(k, _)| k.clone()),
+            Some(m) => self
+                .token_delta
+                .iter()
+                .filter(|((_, mint), d)| mint == m && **d < 0)
+                .min_by_key(|(_, d)| **d)
+                .map(|((k, _), _)| k.clone()),
+        }
+    }
 }
+
 
 #[derive(Clone)]
 struct SigRef {
@@ -495,6 +575,7 @@ pub struct SolanaNetwork {
     pub network_name: String,
     client: reqwest::Client,
     blockhash_cache: RwLock<Option<(RecentBlockhash, Instant)>>,
+    ledger: Ledgerer,
 }
 
 impl SolanaNetwork {
@@ -508,6 +589,7 @@ impl SolanaNetwork {
             network_name,
             client: reqwest::Client::new(),
             blockhash_cache: RwLock::new(None),
+            ledger: Ledgerer::new(),
         }
     }
 
@@ -515,18 +597,12 @@ impl SolanaNetwork {
     /// this too rather than hardcoding a cluster name, or invoices land with a
     /// chain_ref the watcher's WHERE clause never matches.
     pub fn chain_ref(&self) -> String {
-        match self.cluster {
-            SolanaCluster::MainnetBeta => "mainnet-beta",
-            SolanaCluster::Testnet     => "testnet",
-            SolanaCluster::Devnet      => "devnet",
-        }
-            .to_string()
+        self.cluster_label().to_string()
     }
 
     pub fn cluster(&self) -> SolanaCluster {
         self.cluster
     }
-
     /// Standard Solana cluster moniker. Safe to show a payer (e.g. a "Devnet"
     /// banner) — unlike rpc_urls, this reveals nothing about infrastructure.
     pub fn cluster_label(&self) -> &'static str {
@@ -536,7 +612,35 @@ impl SolanaNetwork {
             SolanaCluster::Devnet => "devnet",
         }
     }
-    
+
+    fn chain(&self) -> ChainRef {
+        ChainRef::new(NETWORK_TYPE, self.chain_ref())
+    }
+
+    fn event_index(account_index: i32, is_token: bool) -> (i32, String) {
+        let idx = account_index * 2 + is_token as i32;
+        let r = if is_token {
+            format!("tokbal:{account_index}")
+        } else {
+            format!("lamports:{account_index}")
+        };
+        (idx, r)
+    }
+
+    fn asset_for(&self, mint: Option<&str>) -> AssetKey {
+        match mint {
+            Some(m) => AssetKey::contract(self.chain(), m),
+            None => AssetKey::native(self.chain()),
+        }
+    }
+
+    /// LEDGER.md §2.8. The key that can sign a sweep. NOT `wallet_address`:
+    /// for SPL that is the ATA, which has no private key. `payment_reference`
+    /// is the HD owner for both paths; for native it equals `wallet_address`.
+    fn sweep_authority<'a>(wallet_address: &'a str, payment_reference: Option<&'a str>) -> &'a str {
+        payment_reference.filter(|r| !r.is_empty()).unwrap_or(wallet_address)
+    }
+
     // ── RPC ──────────────────────────────────────────────────────────────────
 
     async fn rpc(&self, method: &'static str, params: Value) -> Result<Value, String> {
@@ -1071,16 +1175,12 @@ impl SolanaNetwork {
     ///      also caught every batch payment across two of one merchant's native
     ///      invoices, because there the reference and the deposit address are the
     ///      same key.
-    fn classify<'a>(
-        &self,
-        tx: &TxView,
-        index: &WatchIndex<'a>,
-    ) -> Vec<(&'a WatchedInvoice, Decimal, &'static str)> {
-        let mut out: Vec<(&WatchedInvoice, Decimal, &'static str)> = Vec::new();
+    fn classify<'a>(&self, tx: &TxView, index: &WatchIndex<'a>) -> Vec<Credit<'a>> {
+        let mut out: Vec<Credit<'a>> = Vec::new();
         let mut credited: HashSet<Uuid> = HashSet::new();
 
         // ── direct ──
-        for key in &tx.account_keys {
+        for (key_idx, key) in tx.account_keys.iter().enumerate() {
             let Some(invs) = index.by_deposit.get(key.as_str()) else { continue };
 
             for inv in invs {
@@ -1102,7 +1202,15 @@ impl SolanaNetwork {
                 match i128_to_decimal(credit) {
                     Ok(d) => {
                         credited.insert(inv.invoice_id);
-                        out.push((*inv, d, "direct"));
+                        out.push(Credit {
+                            inv,
+                            amount: d,
+                            path: "direct",
+                            to_address: &inv.deposit_address,
+                            // `key` IS the deposit address here; its position
+                            // is the one we're iterating.
+                            account_index: key_idx as i32,
+                        });
                     }
                     Err(e) => eprintln!(
                         "[{}] amount overflow on {}: {e}",
@@ -1131,9 +1239,9 @@ impl SolanaNetwork {
                     if split > 0 {
                         eprintln!(
                             "[{}] tx {} paid invoice {} on the direct path AND moved {} into \
-							 the merchant wallet {}. Only the direct leg is credited — a \
-							 single transaction that splits across both paths needs manual \
-							 review.",
+                             the merchant wallet {}. Only the direct leg is credited — a \
+                             single transaction that splits across both paths needs manual \
+                             review.",
                             self.network_name,
                             tx.signature,
                             inv.invoice_id,
@@ -1166,8 +1274,8 @@ impl SolanaNetwork {
             if claimants.len() > 1 {
                 eprintln!(
                     "[{}] tx {} carries {} of our references all pointing at the same credit \
-					 ({} / {}): invoices {}. Refusing to attribute a credit that can't be \
-					 split. Manual review required.",
+                     ({} / {}): invoices {}. Refusing to attribute a credit that can't be \
+                     split. Manual review required.",
                     self.network_name,
                     tx.signature,
                     claimants.len(),
@@ -1182,8 +1290,29 @@ impl SolanaNetwork {
             let merchant_credit = tx.credit(target, inv.mint.as_deref());
 
             if merchant_credit > 0 {
+                // The reference key is what we FOUND the tx by; the merchant
+                // target is what was CREDITED. The movement must name the latter.
+                let Some(account_index) = tx.account_index(target) else {
+                    // A balance moved on an account the message doesn't list.
+                    // Can only happen if the deltas were built from a different
+                    // key list than account_keys. Refuse rather than fabricate
+                    // an ordinal.
+                    eprintln!(
+                        "[{}] tx {} credited {} but it is not in account_keys — \
+                         classifier/TxView disagree",
+                        self.network_name, tx.signature, target
+                    );
+                    continue;
+                };
+
                 match i128_to_decimal(merchant_credit) {
-                    Ok(d) => out.push((inv, d, "reference")),
+                    Ok(d) => out.push(Credit {
+                        inv,
+                        amount: d,
+                        path: "reference",
+                        to_address: &inv.merchant_target,
+                        account_index,
+                    }),
                     Err(e) => eprintln!(
                         "[{}] amount overflow on {}: {e}",
                         self.network_name, tx.signature
@@ -1207,6 +1336,7 @@ impl SolanaNetwork {
         out
     }
 
+
     /// Record every credit this transaction produced, and return the invoices it
     /// touched so the caller can recompute their totals once.
     ///
@@ -1225,6 +1355,13 @@ impl SolanaNetwork {
         tx: &TxView,
         index: &WatchIndex<'_>,
     ) -> Result<Vec<Uuid>, String> {
+        // A failed tx moved nothing. If the caller already filters these this
+        // is free; if not, it's the difference between a phantom movement and
+        // none.
+        if tx.failed {
+            return Ok(Vec::new());
+        }
+
         let credits = self.classify(tx, index);
         if credits.is_empty() {
             return Ok(Vec::new());
@@ -1236,95 +1373,154 @@ impl SolanaNetwork {
             .map_err(|e| format!("apply_transaction begin tx: {e}"))?;
 
         let mut touched = Vec::with_capacity(credits.len());
+        let mut transfers = Vec::with_capacity(credits.len());
 
-        for (inv, amount, path) in credits {
-            let inserted = sqlx::query(
+        for c in &credits {
+            let inv = c.inv;
+
+            // RETURNING id so the movement can point at its payment. ON
+            // CONFLICT DO NOTHING returns no row, which is how "new" is told
+            // apart from "seen".
+            let inserted: Option<Uuid> = sqlx::query_scalar(
                 r#"
-				INSERT INTO payments
-					(invoice_id, tx_hash, amount, block_number, block_hash,
-					 confirmations, status, payment_path)
-				VALUES ($1, $2, $3, $4, '', $5, 'detected', $6)
-				ON CONFLICT (invoice_id, tx_hash) DO NOTHING
-				"#,
+                INSERT INTO payments
+                    (invoice_id, tx_hash, amount, block_number, block_hash,
+                     confirmations, status, payment_path)
+                VALUES ($1, $2, $3, $4, '', $5, 'detected', $6)
+                ON CONFLICT (invoice_id, tx_hash) DO NOTHING
+                RETURNING id
+                "#,
             )
                 .bind(inv.invoice_id)
                 .bind(&tx.signature)
-                .bind(amount)
+                .bind(c.amount)
                 .bind(tx.slot)
                 .bind(CONF_DETECTED)
-                .bind(path)
-                .execute(&mut *db_tx)
+                .bind(c.path)
+                .fetch_optional(&mut *db_tx)
                 .await
-                .map_err(|e| format!("insert payment: {e}"))?
-                .rows_affected()
-                == 1;
+                .map_err(|e| format!("insert payment: {e}"))?;
 
-            if inserted {
-                println!(
-                    "[{}] detected {} {} via {} path -> invoice {} (merchant {}, sig {}, slot {})",
-                    self.network_name,
-                    amount,
-                    inv.mint.as_deref().unwrap_or("lamports"),
-                    path,
-                    inv.invoice_id,
-                    inv.merchant_id,
-                    tx.signature,
-                    tx.slot
-                );
+            let payment_id = match inserted {
+                Some(id) => {
+                    println!(
+                        "[{}] detected {} {} via {} path -> invoice {} (merchant {}, sig {}, slot {})",
+                        self.network_name,
+                        c.amount,
+                        inv.mint.as_deref().unwrap_or("lamports"),
+                        c.path,
+                        inv.invoice_id,
+                        inv.merchant_id,
+                        tx.signature,
+                        tx.slot
+                    );
 
-                let mut fields = Map::new();
-                fields.insert("Signature".into(), json!(tx.signature));
-                fields.insert("AmountBaseUnits".into(), json!(amount.to_string()));
-                fields.insert("Slot".into(), json!(tx.slot));
-                fields.insert("Mint".into(), json!(inv.mint));
-                fields.insert("PaymentPath".into(), json!(path));
-                fields.insert("Confirmations".into(), json!(CONF_DETECTED));
-                fields.insert("ConfirmationLevel".into(), json!("detected"));
+                    let mut fields = Map::new();
+                    fields.insert("Signature".into(), json!(tx.signature));
+                    fields.insert("AmountBaseUnits".into(), json!(c.amount.to_string()));
+                    fields.insert("Slot".into(), json!(tx.slot));
+                    fields.insert("Mint".into(), json!(inv.mint));
+                    fields.insert("PaymentPath".into(), json!(c.path));
+                    fields.insert("Confirmations".into(), json!(CONF_DETECTED));
+                    fields.insert("ConfirmationLevel".into(), json!("detected"));
 
-                // webhook_events is UNIQUE (merchant_id, dedupe_key). The bare
-                // signature collides when one transaction pays two invoices
-                // belonging to the same merchant — the second event was being
-                // swallowed. Scope every key to its event type and its subject.
-                let dedupe_key = format!("payment.detected:{}:{}", inv.invoice_id, tx.signature);
+                    // webhook_events is UNIQUE (merchant_id, dedupe_key). The bare
+                    // signature collides when one transaction pays two invoices
+                    // belonging to the same merchant — the second event was being
+                    // swallowed. Scope every key to its event type and its subject.
+                    let dedupe_key = format!("payment.detected:{}:{}", inv.invoice_id, tx.signature);
 
-                enqueue_webhook(
-                    &mut db_tx,
-                    inv.invoice_id,
-                    "payment.detected",
-                    &dedupe_key,
-                    fields,
-                )
-                    .await?;
-            } else {
-                // Seen before. The only thing worth writing is a resurrection: a
-                // transaction we orphaned that has since re-landed. The amount is
-                // never rewritten — the same signature always moved the same
-                // money, and letting it change would let a replay inflate a total.
-                sqlx::query(
-                    r#"
-					UPDATE payments
-					   SET block_number = $2,
-						   status = 'detected',
-						   confirmations = $3,
-						   payment_path = COALESCE(payment_path, $5),
-						   updated_at = now()
-					 WHERE invoice_id = $1
-					   AND tx_hash = $4
-					   AND status = 'orphaned'
-					"#,
-                )
-                    .bind(inv.invoice_id)
-                    .bind(tx.slot)
-                    .bind(CONF_DETECTED)
-                    .bind(&tx.signature)
-                    .bind(path)
-                    .execute(&mut *db_tx)
-                    .await
-                    .map_err(|e| format!("relocate payment: {e}"))?;
-            }
+                    enqueue_webhook(&mut db_tx, inv.invoice_id, "payment.detected", &dedupe_key, fields)
+                        .await?;
+                    id
+                }
+                None => {
+                    // Seen before. The only thing worth writing is a resurrection: a
+                    // transaction we orphaned that has since re-landed. The amount is
+                    // never rewritten — the same signature always moved the same
+                    // money, and letting it change would let a replay inflate a total.
+                    sqlx::query(
+                        r#"
+                        UPDATE payments
+                           SET block_number = $2,
+                               status = 'detected',
+                               confirmations = $3,
+                               payment_path = COALESCE(payment_path, $5),
+                               updated_at = now()
+                         WHERE invoice_id = $1
+                           AND tx_hash = $4
+                           AND status = 'orphaned'
+                        "#,
+                    )
+                        .bind(inv.invoice_id)
+                        .bind(tx.slot)
+                        .bind(CONF_DETECTED)
+                        .bind(&tx.signature)
+                        .bind(c.path)
+                        .execute(&mut *db_tx)
+                        .await
+                        .map_err(|e| format!("relocate payment: {e}"))?;
+
+                    // Still need the id: record_detected re-links the movement
+                    // (ON CONFLICT DO NOTHING on (tx_id, event_index) — harmless).
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT id FROM payments WHERE invoice_id = $1 AND tx_hash = $2",
+                    )
+                        .bind(inv.invoice_id)
+                        .bind(&tx.signature)
+                        .fetch_one(&mut *db_tx)
+                        .await
+                        .map_err(|e| format!("fetch payment id: {e}"))?
+                }
+            };
+
+            let is_token = inv.mint.is_some();
+            let (event_index, event_ref) = Self::event_index(c.account_index, is_token);
+
+            transfers.push(ObservedTransfer {
+                event_index,
+                event_ref: Some(event_ref),
+                asset: self.asset_for(inv.mint.as_deref()),
+                amount: c.amount,
+                from_address: tx.debit_source(inv.mint.as_deref()),
+                from_kind: Some(AddressKind::External),
+                to_address: Some(c.to_address.to_string()),
+                to_kind: Some(match c.path {
+                    "reference" => AddressKind::MerchantMain,
+                    _ => AddressKind::DepositAddress,
+                }),
+                merchant_id: Some(inv.merchant_id),
+                invoice_id: Some(inv.invoice_id),
+                payment_id: Some(payment_id),
+                token_id: Some(inv.token_id.clone()),
+            });
 
             touched.push(inv.invoice_id);
         }
+
+        // Chain layer, same transaction. A tx paying invoices of two different
+        // merchants has merchant_id = None on the tx row; movements carry their own.
+        let tx_merchant = {
+            let first = credits[0].inv.merchant_id;
+            credits.iter().all(|c| c.inv.merchant_id == first).then_some(first)
+        };
+
+        self.ledger
+            .record_detected(
+                &mut *db_tx,
+                &ObservedInbound {
+                    chain: self.chain(),
+                    tx_hash: tx.signature.clone(),
+                    block_number: Some(tx.slot),
+                    block_hash: None, // Solana keys on slot; leave NULL
+                    block_time: tx.block_time.and_then(|t| DateTime::from_timestamp(t, 0)),
+                    merchant_id: tx_merchant,
+                    token_id: None, // observed, not initiated; route is on each movement
+                    transfers,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
         db_tx
             .commit()
@@ -1333,6 +1529,7 @@ impl SolanaNetwork {
 
         Ok(touched)
     }
+
 
     // ── Confirmation / finality ──────────────────────────────────────────────
 
@@ -1511,10 +1708,10 @@ impl SolanaNetwork {
 
         sqlx::query(
             r#"
-			UPDATE payments
-			   SET confirmations = $2, updated_at = now()
-			 WHERE id = $1 AND confirmations <> $2 AND status <> 'orphaned'
-			"#,
+            UPDATE payments
+               SET confirmations = $2, updated_at = now()
+             WHERE id = $1 AND confirmations <> $2 AND status <> 'orphaned'
+            "#,
         )
             .bind(payment_id)
             .bind(conf)
@@ -1524,15 +1721,20 @@ impl SolanaNetwork {
 
         // ── merchant threshold ───────────────────────────────────────────────
         if current_status == "detected" && reached >= required {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| format!("promote begin tx (confirmed): {e}"))?;
+
             let promoted = sqlx::query(
                 r#"
-				UPDATE payments
-				   SET status = 'merchant_confirmed', updated_at = now()
-				 WHERE id = $1 AND status = 'detected'
-				"#,
+                UPDATE payments
+                   SET status = 'merchant_confirmed', updated_at = now()
+                 WHERE id = $1 AND status = 'detected'
+                "#,
             )
                 .bind(payment_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("promote merchant_confirmed: {e}"))?
                 .rows_affected()
@@ -1547,10 +1749,11 @@ impl SolanaNetwork {
                     required.label()
                 );
 
-                let mut tx = pool
-                    .begin()
+                // Chain layer only. No journal at this level (§5.3).
+                self.ledger
+                    .mark_confirmed(&mut *tx, &self.chain(), signature)
                     .await
-                    .map_err(|e| format!("promote begin tx (confirmed): {e}"))?;
+                    .map_err(|e| e.to_string())?;
 
                 let mut fields = Map::new();
                 fields.insert("PaymentId".into(), json!(payment_id));
@@ -1572,8 +1775,11 @@ impl SolanaNetwork {
                 tx.commit()
                     .await
                     .map_err(|e| format!("promote commit tx (confirmed): {e}"))?;
+            } else {
+                tx.rollback().await.ok();
             }
         }
+
 
         // ── finality ─────────────────────────────────────────────────────────
         // Terminal. Once the cluster roots a slot it can't be undone, so this is
@@ -1581,51 +1787,156 @@ impl SolanaNetwork {
         // `status <> 'orphaned'` guard matters: without it a row we orphaned
         // earlier in this same pass could be resurrected by a stale status read.
         if reached == ConfirmLevel::Finalized {
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|e| format!("promote begin tx (finalized): {e}"))?;
+
+            // §5.4: the guarded UPDATE and the journal are one transaction. A
+            // crash between them would otherwise leave a system_confirmed
+            // payment with no journal and no way to ever notice.
             let finalized = sqlx::query(
                 r#"
-				UPDATE payments
-				   SET status = 'system_confirmed',
-					   confirmations = $2,
-					   updated_at = now()
-				 WHERE id = $1
-				   AND status NOT IN ('system_confirmed', 'orphaned')
-				"#,
+                UPDATE payments
+                   SET status = 'system_confirmed',
+                       confirmations = $2,
+                       updated_at = now()
+                 WHERE id = $1
+                   AND status NOT IN ('system_confirmed', 'orphaned')
+                "#,
             )
                 .bind(payment_id)
                 .bind(CONF_FINALIZED)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("promote system_confirmed: {e}"))?
                 .rows_affected()
                 == 1;
 
-            if finalized {
-                println!(
-                    "[{}] payment {} finalized at slot {}, no longer polled",
-                    self.network_name, payment_id, slot
-                );
-
-                let mut tx = pool
-                    .begin()
-                    .await
-                    .map_err(|e| format!("promote begin tx (finalized): {e}"))?;
-
-                let mut fields = Map::new();
-                fields.insert("PaymentId".into(), json!(payment_id));
-                fields.insert("Signature".into(), json!(signature));
-                fields.insert("Slot".into(), json!(slot));
-                fields.insert("Confirmations".into(), json!(CONF_FINALIZED));
-                fields.insert("ConfirmationLevel".into(), json!("finalized"));
-
-                let dedupe_key = format!("payment.finalized:{payment_id}");
-
-                enqueue_webhook(&mut tx, invoice_id, "payment.finalized", &dedupe_key, fields)
-                    .await?;
-
-                tx.commit()
-                    .await
-                    .map_err(|e| format!("promote commit tx (finalized): {e}"))?;
+            if !finalized {
+                tx.rollback().await.ok();
+                return Ok(());
             }
+
+            println!(
+                "[{}] payment {} finalized at slot {}, no longer polled",
+                self.network_name, payment_id, slot
+            );
+
+            // Everything recognition needs, read inside the same tx. The
+            // lateral picks the asset off the payment's own movement rather
+            // than re-deriving it from invoices.token_address.
+            let ctx = sqlx::query(
+                r#"
+                    SELECT i.merchant_id, i.token_id, i.wallet_address, i.payment_reference,
+                           i.wallet_index, p.payment_path,
+                           m.mint, m.asset_params
+                      FROM payments p
+                      JOIN invoices i ON i.id = p.invoice_id
+                      LEFT JOIN LATERAL (
+                          -- Native rows store address = '' (see assets table). Collapse that
+                          -- to NULL so `mint.is_some()` means "this is an SPL asset" and
+                          -- nothing else.
+                          SELECT NULLIF(a.address, '') AS mint,
+                                 a.asset_params
+                            FROM chain_movements cm
+                            JOIN assets a ON a.id = cm.asset_id
+                           WHERE cm.payment_id = p.id
+                           ORDER BY cm.event_index
+                           LIMIT 1
+                      ) m ON true
+                     WHERE p.id = $1
+                    "#,
+            )
+
+                .bind(payment_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| format!("recognition ctx: {e}"))?;
+
+            let merchant_id: Uuid = ctx.get("merchant_id");
+            let token_id: String = ctx.get("token_id");
+            let wallet_address: String = ctx.get("wallet_address");
+            let payment_reference: Option<String> = ctx.get("payment_reference");
+            let wallet_index: Option<i32> = ctx.get("wallet_index");
+            let path_str: String = ctx.get("payment_path");
+            let mint: Option<String> = ctx.get("mint");
+            let asset_params: serde_json::Value =
+                ctx.get::<Option<serde_json::Value>, _>("asset_params").unwrap_or(json!({}));
+
+            let path = PaymentPath::from_db(&path_str)
+                .ok_or_else(|| format!("payment {payment_id}: unknown payment_path {path_str}"))?;
+
+            // §2.8 / §8.1: custody is the ATA (or owner for native), authority
+            // is the HD owner, gas wallet pays. Only meaningful for the direct
+            // path; reference-path money is already in the merchant wallet.
+            let custody = (path == PaymentPath::Direct).then(|| {
+                let owner =
+                    Self::sweep_authority(&wallet_address, payment_reference.as_deref()).to_string();
+                Custody {
+                    address: wallet_address.clone(),
+                    kind: AddressKind::DepositAddress,
+                    authority_address: owner.clone(),
+                    authority_ref: wallet_index.map(|i| i.to_string()),
+                    sweep_params: json!({
+                        "mint": mint,
+                        "owner": owner,
+                        "token_program": asset_params.get("token_program"),
+                        "ata_program": asset_params.get("ata_program"),
+                        "external_fee_payer": true,
+                        // Policy; make configurable. Reclaims the ATA rent.
+                        "close_ata_after_sweep": mint.is_some(),
+                    }),
+                }
+            });
+
+            let outcome = self
+                .ledger
+                .recognize_payment(
+                    &mut *tx,
+                    &RecognizeInput {
+                        chain: self.chain(),
+                        tx_hash: signature.to_string(),
+                        payment_id,
+                        invoice_id,
+                        merchant_id,
+                        token_id,
+                        path,
+                        block_time: None, // stamped on chain_txs at detection
+                        custody,
+                        already_swept: false, // until payments.swept_by_tx_id exists
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if let Some(j) = outcome.journal_id {
+                println!(
+                    "[{}] payment {} recognized: journal {} amount {} fee {} ({} bps), {} sweep row(s)",
+                    self.network_name,
+                    payment_id,
+                    j,
+                    outcome.amount,
+                    outcome.fee,
+                    outcome.fee_bps,
+                    outcome.sweep_rows_enqueued
+                );
+            }
+
+            let mut fields = Map::new();
+            fields.insert("PaymentId".into(), json!(payment_id));
+            fields.insert("Signature".into(), json!(signature));
+            fields.insert("Slot".into(), json!(slot));
+            fields.insert("Confirmations".into(), json!(CONF_FINALIZED));
+            fields.insert("ConfirmationLevel".into(), json!("finalized"));
+
+            let dedupe_key = format!("payment.finalized:{payment_id}");
+
+            enqueue_webhook(&mut tx, invoice_id, "payment.finalized", &dedupe_key, fields).await?;
+
+            tx.commit()
+                .await
+                .map_err(|e| format!("promote commit tx (finalized): {e}"))?;
         }
 
         Ok(())
@@ -1654,10 +1965,10 @@ impl SolanaNetwork {
 
         let orphaned = sqlx::query(
             r#"
-			UPDATE payments
-			   SET status = 'orphaned', confirmations = 0, updated_at = now()
-			 WHERE id = $1 AND status <> 'orphaned'
-			"#,
+            UPDATE payments
+               SET status = 'orphaned', confirmations = 0, updated_at = now()
+             WHERE id = $1 AND status <> 'orphaned'
+            "#,
         )
             .bind(payment_id)
             .execute(&mut *tx)
@@ -1675,6 +1986,35 @@ impl SolanaNetwork {
             "[{}] payment {} orphaned ({}), sig {} at slot {}, prev status {}",
             self.network_name, payment_id, reason, signature, slot, previous_status
         );
+
+        // §5.1: on Solana a rooted slot never drops, so this must never find a
+        // journal. If it does, the Ledgerer refuses to write a reversal, we
+        // roll everything back, and the payments row stays at its previous
+        // status for a human to look at. A silent book change is the one
+        // outcome that's worse than a stuck row.
+        if let Err(e) = self
+            .ledger
+            .orphan(
+                &mut *tx,
+                &OrphanInput {
+                    chain: self.chain(),
+                    tx_hash: signature.to_string(),
+                    payment_id,
+                    finality: Finality::Absolute,
+                    reason: reason.to_string(),
+                },
+            )
+            .await
+        {
+            match &e {
+                LedgerError::ImpossibleReversal { .. } | LedgerError::SweepInFlight { .. } => {
+                    eprintln!("[{}] REFUSING to orphan payment {payment_id}: {e}", self.network_name);
+                }
+                _ => {}
+            }
+            tx.rollback().await.ok();
+            return Err(e.to_string());
+        }
 
         let mut fields = Map::new();
         fields.insert("PaymentId".into(), json!(payment_id));
@@ -1839,6 +2179,7 @@ impl SolanaNetwork {
             (
                 Uuid,           // id
                 Uuid,           // merchant_id
+                String,         // token_id (route the invoice was created with)
                 String,         // wallet_address (deposit target)
                 Option<String>, // payment_reference
                 Option<String>, // merchant main wallet
@@ -1850,34 +2191,35 @@ impl SolanaNetwork {
             ),
         >(
             r#"
-			SELECT i.id,
-				   i.merchant_id,
-				   i.wallet_address,
-				   i.payment_reference,
-				   mw.address,
-				   i.amount_requested,
-				   i.token_address,
-				   i.token_program,
-				   i.required_confirmations,
-				   i.created_block
-			  FROM invoices i
-			  LEFT JOIN merchant_wallets mw
-					 ON mw.merchant_id = i.merchant_id
-					AND mw.network_type = $1
-			 WHERE i.network_type = $1
-			   AND i.chain_ref = $2
-			   AND i.wallet_address IS NOT NULL
-			   AND i.wallet_address <> ''
-			   AND (
-					 (i.status IN ('pending','underpaid') AND i.expires_at > now())
-				  OR EXISTS (
-					   SELECT 1 FROM payments p
-						WHERE p.invoice_id = i.id
-						  AND p.status IN ('detected','merchant_confirmed')
-					 )
-				   )
-			 ORDER BY i.created_at ASC
-			 LIMIT $3
+            SELECT i.id,
+                   i.merchant_id,
+                   i.token_id,
+                   i.wallet_address,
+                   i.payment_reference,
+                   mw.address,
+                   i.amount_requested,
+                   i.token_address,
+                   i.token_program,
+                   i.required_confirmations,
+                   i.created_block
+              FROM invoices i
+              LEFT JOIN merchant_wallets mw
+                     ON mw.merchant_id = i.merchant_id
+                    AND mw.network_type = $1
+             WHERE i.network_type = $1
+               AND i.chain_ref = $2
+               AND i.wallet_address IS NOT NULL
+               AND i.wallet_address <> ''
+               AND (
+                     (i.status IN ('pending','underpaid') AND i.expires_at > now())
+                  OR EXISTS (
+                       SELECT 1 FROM payments p
+                        WHERE p.invoice_id = i.id
+                          AND p.status IN ('detected','merchant_confirmed')
+                     )
+                   )
+             ORDER BY i.created_at ASC
+             LIMIT $3
 			"#,
         )
             .bind(NETWORK_TYPE)
@@ -1901,6 +2243,7 @@ impl SolanaNetwork {
         for (
             invoice_id,
             merchant_id,
+            token_id,
             deposit_address,
             payment_reference,
             merchant_wallet,
@@ -1967,6 +2310,7 @@ impl SolanaNetwork {
             out.push(WatchedInvoice {
                 invoice_id,
                 merchant_id,
+                token_id,
                 deposit_address,
                 payment_reference,
                 merchant_target,
@@ -2229,6 +2573,8 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| "transaction missing slot".to_string())?;
 
+    let block_time = raw.get("blockTime").and_then(|v| v.as_i64());
+
     // `.get` returns Some(Value::Null) for an explicit null, which then made the
     // `err` probe below read `false` — a transaction with no meta was being
     // treated as successful until it failed on preBalances several lines later.
@@ -2304,7 +2650,6 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
         }
     }
 
-    let account_keys: HashSet<String> = ordered_keys.iter().cloned().collect();
 
     // ── native lamport deltas ──
     let pre = meta
@@ -2378,8 +2723,9 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
     Ok(TxView {
         signature: signature.to_string(),
         slot,
+        block_time,
         failed,
-        account_keys,
+        account_keys: ordered_keys,
         signers,
         native_delta,
         token_delta,
@@ -2397,11 +2743,7 @@ impl NetworkClient for SolanaNetwork {
     }
 
     fn chain_ref(&self) -> String {
-        match self.cluster {
-            SolanaCluster::MainnetBeta => "mainnet-beta".to_string(),
-            SolanaCluster::Testnet => "testnet".to_string(),
-            SolanaCluster::Devnet => "devnet".to_string(),
-        }
+        SolanaNetwork::chain_ref(self)
     }
     // --- WALLET METHODS ---
     async fn get_derive_address(

@@ -1,5 +1,5 @@
 -- =========================================================================
--- 010_ledger.sql
+-- 0003_ledger.sql
 --
 -- Ledger, movements, sweeping and fees.
 -- Companion to LEDGER.md. Requires PostgreSQL 15+ (UNIQUE NULLS NOT DISTINCT).

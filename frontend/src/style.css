@@ -4,6 +4,7 @@
    import at the top of the file).
    ============================================================= */
 
+@import "tailwindcss";
 @import url('https://fonts.googleapis.com/css2?family=Jost:wght@200;300;400&family=IBM+Plex+Mono:wght@300;400&display=swap');
 
 /* --- Tailwind v4 tokens ------------------------------------------------
@@ -11,6 +12,7 @@
    Tailwind. On Tailwind v3, delete this block and put the same colours in
    theme.extend.colors in tailwind.config.js instead — the :root block
    below is what the component classes actually use, so nothing breaks. */
+
 @theme {
   --color-paper: #F1F4F5;
   --color-surface: #FAFCFC;
@@ -26,8 +28,6 @@
 
   --font-sans: 'Jost', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
-
-  --radius-none: 0px;
 }
 
 :root {

@@ -3,110 +3,125 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="src/styleTW.css" />
   <title>Ledger — Vestro</title>
-  <link rel="stylesheet" href="/src/ledger.css" />
 </head>
-<body class="page">
+<body class="ledger-view">
 
-<main class="shell">
+<div class="app">
 
-  <!-- Masthead -->
-  <header class="masthead">
-    <p class="eyebrow">Vestro / Ledger</p>
-    <h1 class="display">Ledger</h1>
-    <p class="body">Every balance here is derived from postings, not from chain reads. Custody is what the deposit
-      addresses hold; payable is what you can withdraw once it is swept. The two sides of each asset sum to zero.</p>
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar-id">
+      <p class="eyebrow">Vestro / Ledger</p>
+      <h1 class="display display--compact">Ledger</h1>
+      <p class="topbar-note">Every payment recognised is written as a balanced pair of entries.</p>
+    </div>
 
-    <div class="section--tight rows" id="ident"></div>
+    <div class="topbar-right">
+      <div class="topbar-meta">
+        <span class="status" id="feed-status"><span class="dot"></span><span id="feed-word">Idle</span></span>
+        <span class="meta-pair">
+          <span class="label">Snapshot</span>
+          <span class="row-value" id="generated-at">—</span>
+        </span>
+        <a href="/new-invoice.html" class="link link--arrow">Create an invoice →</a>
+      </div>
+
+      <div class="controls">
+        <div class="control control--wide">
+          <div class="field-head"><label class="label" for="scope">Merchant</label></div>
+          <select id="scope" class="input input--mono">
+            <option value="__global__">All merchants</option>
+          </select>
+        </div>
+
+        <div class="control control--id hidden" id="custom-scope">
+          <div class="field-head"><label class="label" for="custom-id">Merchant ID</label></div>
+          <input type="text" id="custom-id" class="input input--mono" spellcheck="false"
+                 autocomplete="off" placeholder="00000000-0000-0000-0000-000000000000" />
+        </div>
+        <button type="button" id="custom-apply" class="btn btn--auto hidden">Use</button>
+
+        <div class="control control--narrow">
+          <div class="field-head"><label class="label" for="limit">Journals</label></div>
+          <select id="limit" class="input input--mono">
+            <option value="25">25</option>
+            <option value="60" selected>60</option>
+            <option value="120">120</option>
+            <option value="250">250</option>
+            <option value="500">500</option>
+          </select>
+        </div>
+
+        <button type="button" id="auto" class="btn btn--ghost btn--auto">Auto refresh off</button>
+        <button type="button" id="refresh" class="btn btn--auto">Refresh</button>
+      </div>
+    </div>
   </header>
 
-  <!-- Scope -->
-  <section class="section--tight scope">
-    <div class="choices" id="scope" role="radiogroup" aria-label="Network scope"></div>
-    <p class="label label--faint" id="as-of">&nbsp;</p>
+  <div id="error-box" class="warning warning--stop hidden"></div>
+
+  <!-- Summary strip -->
+  <section class="strip">
+    <div class="tags" id="tags"></div>
   </section>
 
-  <!-- Counts -->
-  <section class="section--tight panel">
-    <div class="rows" id="counts"></div>
-  </section>
+  <!-- Body -->
+  <div class="columns">
 
-  <!-- Positions -->
-  <section class="section panel panel--flush">
-    <div class="panel-head">
-      <span class="label">Positions</span>
-      <span class="status" id="integrity"><span class="dot"></span><span></span></span>
+    <div class="col col--main">
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="label">Positions</span>
+          <span class="label label--faint" id="positions-count">—</span>
+        </div>
+        <div id="positions" class="cards reserve-140"></div>
+      </section>
+
+      <!-- Journals — the live region -->
+      <section class="panel panel--fill" id="journals-panel">
+        <div class="panel-head">
+          <span class="label">Journals</span>
+          <span class="label label--faint" id="journals-count">—</span>
+        </div>
+        <div id="journals" class="scroller reserve-240"></div>
+      </section>
+
     </div>
 
-    <div class="table-wrap">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Asset</th>
-            <th>Network</th>
-            <th class="right">Unswept</th>
-            <th class="right">Treasury</th>
-            <th class="right">Gas</th>
-            <th class="right">Owed to you</th>
-            <th class="right">Fees</th>
-            <th class="right">Unexplained</th>
-          </tr>
-        </thead>
-        <tbody id="positions"></tbody>
-      </table>
+    <div class="col col--side">
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="label">Reconciliation</span>
+          <span class="label label--faint">Ledger against queue</span>
+        </div>
+        <div id="reconciliation" class="reserve-100"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="label">Sweep backlog</span>
+          <span class="label label--faint" id="backlog-count">—</span>
+        </div>
+        <div id="backlog" class="reserve-100"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="label">Accounts</span>
+          <span class="label label--faint" id="accounts-count">—</span>
+        </div>
+        <div id="accounts" class="reserve-100"></div>
+      </section>
+
     </div>
 
-    <div class="panel-note">
-      <p class="label label--faint">Select an asset for its account legs</p>
-    </div>
-  </section>
+  </div>
 
-  <!-- Live region: postings -->
-  <section class="section live" id="postings-panel">
-    <div class="panel-head">
-      <span class="label label--accent">Postings</span>
-      <span class="status">
-        <span class="dot pulse"></span>
-        <span id="postings-state">Watching</span>
-      </span>
-    </div>
-
-    <div id="postings" aria-live="polite" aria-relevant="additions"></div>
-  </section>
-
-  <!-- Reconciliation -->
-  <section class="section panel panel--flush">
-    <div class="panel-head">
-      <span class="label">Unswept reconciliation</span>
-      <span class="status" id="recon-state"><span class="dot"></span><span></span></span>
-    </div>
-
-    <div class="table-wrap">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Asset</th>
-            <th>Network</th>
-            <th class="right">Ledger</th>
-            <th class="right">Queued</th>
-            <th class="right">Abandoned</th>
-            <th class="right">Drift</th>
-            <th class="right">State</th>
-          </tr>
-        </thead>
-        <tbody id="recon"></tbody>
-      </table>
-    </div>
-
-    <div class="panel-note" id="recon-note"></div>
-  </section>
-
-  <p class="footnote">
-    Custody stays in deposit addresses until a sweep moves it to treasury.
-    <a class="arrow-link" href="/sweeps.html"><span class="t">Sweeping</span><span class="a">&#8594;</span></a>
-  </p>
-
-</main>
+</div>
 
 <script type="module" src="/src/ledger.ts"></script>
 </body>

@@ -1,678 +1,988 @@
-/**
- * Vestro — merchant ledger (dummy)
- *
- * Shapes mirror the read models: v_merchant_positions, v_ledger_balances,
- * v_unswept_reconciliation. Amounts are base units and are held as bigint,
- * because an 18-decimal asset overflows Number well before it overflows the
- * numeric column it came from.
- *
- * Account kinds beyond `custody_unswept` and `payable_to_merchant` are inferred
- * from the columns of v_merchant_positions — rename them to match the enum.
- */
+/* =============================================================
+   Vestro — ledger overview
+   Reads GET /api/test/ledger and renders positions, journals,
+   accounts, sweep backlog and reconciliation.
+   ============================================================= */
 
-/* ── types ─────────────────────────────────────────────────────────── */
+import './style.css';
+import './ledger.css';
 
-type NetworkType = 'solana' | 'evm' | 'bitcoin';
-type AssetKind = 'native' | 'contract';
+/* ---------------------------------------------------------------
+   API contract — mirrors LedgerOverviewResponse
+   --------------------------------------------------------------- */
 
-type AccountKind =
-  | 'custody_unswept'
-  | 'custody_treasury'
-  | 'custody_gas'
-  | 'custody_unsupported'
-  | 'payable_to_merchant'
-  | 'fees_receivable'
-  | 'gas_advanced'
-  | 'unexplained';
-
-interface Asset {
-  id: string;
-  network_type: NetworkType;
+export interface PositionRow {
+  merchant_id: string;
+  asset_id: string;
+  network_type: string;
   chain_ref: string;
-  asset_kind: AssetKind;
-  address: string | null;
-  decimals: number;
   symbol: string | null;
-  registered: boolean;
+  decimals: number;
+  asset_registered: boolean;
+  unswept: string;
+  treasury: string;
+  gas: string;
+  unsupported: string;
+  owed_to_merchant: string;
+  fees_owed_by_merchant: string;
+  gas_advanced: string;
+  unexplained: string;
 }
 
-/** One row of v_ledger_balances. Signed: custody debits positive, credits negative. */
-interface LedgerBalance {
+export interface AccountBalanceRow {
   account_id: string;
-  kind: AccountKind;
+  merchant_id: string;
+  kind: string;
   asset_id: string;
-  balance: bigint;
+  network_type: string;
+  chain_ref: string;
+  asset_kind: string;
+  asset_address: string | null;
+  symbol: string | null;
+  decimals: number;
+  asset_registered: boolean;
+  balance: string;
   entry_count: number;
-  last_activity_at: string;
+  last_activity_at: string | null;
 }
 
-/** One row of v_merchant_positions. Presentation signs, as the view emits them. */
-interface Position {
+export interface EntryRow {
+  entry_no: number;
+  account_id: string;
+  account_kind: string;
   asset_id: string;
-  unswept: bigint;
-  treasury: bigint;
-  gas: bigint;
-  unsupported: bigint;
-  owed_to_merchant: bigint;
-  fees_owed_by_merchant: bigint;
-  gas_advanced: bigint;
-  unexplained: bigint;
+  symbol: string | null;
+  decimals: number;
+  network_type: string;
+  chain_ref: string;
+  amount: string;
 }
 
-/** One row of v_unswept_reconciliation. */
-interface Reconciliation {
-  asset_id: string;
-  ledger_unswept: bigint;
-  queue_active: bigint;
-  queue_abandoned: bigint;
-  drift: bigint;
-}
-
-type StatusTone = 'muted' | 'accent' | 'ok' | 'warn' | 'stop';
-
-interface Leg {
-  kind: AccountKind;
-  asset_id: string;
-  amount: bigint;
-}
-
-interface Movement {
+export interface JournalRow {
   id: string;
-  event: string;
-  status: string;
-  tone: StatusTone;
+  kind: string;
+  dedupe_key: string;
+  merchant_id: string;
+  tx_id: string | null;
+  payment_id: string | null;
+  reverses: string | null;
+  metadata: Record<string, unknown> | null;
   occurred_at: string;
-  invoice_id?: string;
-  tx_hash?: string;
-  legs: [Leg, Leg];
+  created_at: string;
+  tx_hash: string | null;
+  network_type: string | null;
+  chain_ref: string | null;
+  entries: EntryRow[];
 }
 
-const MERCHANT_ID = '14357362-c5b8-4dde-bbfe-f06aae09d769';
+export interface SweepBacklogRow {
+  merchant_id: string;
+  network_type: string;
+  chain_ref: string;
+  asset_id: string;
+  symbol: string | null;
+  decimals: number;
+  custody_address: string;
+  custody_kind: string;
+  authority_address: string | null;
+  movement_count: number;
+  total_amount: string;
+  oldest_enqueued_at: string | null;
+  next_available_at: string | null;
+  max_attempts: number;
+}
 
-/* ── seed ──────────────────────────────────────────────────────────── */
+export interface ReconciliationRow {
+  merchant_id: string;
+  asset_id: string;
+  symbol: string | null;
+  decimals: number;
+  network_type: string;
+  chain_ref: string;
+  ledger_unswept: string;
+  queue_active: string;
+  queue_abandoned: string;
+  drift: string;
+}
 
-const ASSETS: Asset[] = [
-  {
-    id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d',
-    network_type: 'solana', chain_ref: 'devnet', asset_kind: 'contract',
-    address: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
-    decimals: 6, symbol: 'USDC', registered: true,
-  },
-  {
-    id: '4f602629-b686-457a-b52b-41d900bc4f45',
-    network_type: 'solana', chain_ref: 'devnet', asset_kind: 'native',
-    address: null, decimals: 9, symbol: 'SOL', registered: true,
-  },
-  {
-    id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30',
-    network_type: 'evm', chain_ref: '84532', asset_kind: 'contract',
-    address: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
-    decimals: 6, symbol: 'USDC', registered: true,
-  },
-  {
-    id: 'd0a7c934-1b55-4d02-9f6d-7c3e2a91b884',
-    network_type: 'evm', chain_ref: '84532', asset_kind: 'native',
-    address: null, decimals: 18, symbol: 'ETH', registered: true,
-  },
-  {
-    id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19',
-    network_type: 'bitcoin', chain_ref: 'signet', asset_kind: 'native',
-    address: null, decimals: 8, symbol: 'BTC', registered: true,
-  },
-  {
-    id: 'a9c2f460-3e7b-4a91-8c15-d24f8b0e6733',
-    network_type: 'evm', chain_ref: '84532', asset_kind: 'contract',
-    address: '0x9c3F7bE1a2D04e58c7B1fA6d09E4c2b8351aD7f0',
-    decimals: 18, symbol: null, registered: false,
-  },
-];
+export interface LedgerOverview {
+  generated_at: string;
+  merchant_id: string | null;
+  positions: PositionRow[];
+  accounts: AccountBalanceRow[];
+  journals: JournalRow[];
+  sweep_backlog: SweepBacklogRow[];
+  reconciliation: ReconciliationRow[];
+}
 
-const BALANCES: LedgerBalance[] = [
-  // Solana devnet · USDC — the observed invoice, received and not yet swept
-  { account_id: 'ae99e22b-3b74-4aa7-9a0a-3db662799080', kind: 'custody_unswept',
-    asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', balance: 500000n,
-    entry_count: 1, last_activity_at: '2026-09-07T23:18:49-06:00' },
-  { account_id: '3bc954b5-063a-4b7d-ac46-56fa0661f364', kind: 'payable_to_merchant',
-    asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', balance: -500000n,
-    entry_count: 1, last_activity_at: '2026-09-07T23:18:49-06:00' },
+/* ---------------------------------------------------------------
+   Config
+   --------------------------------------------------------------- */
 
-  // Solana devnet · SOL — gas float advanced by the operator
-  { account_id: '6f10c8d3-2a4e-4b71-9d33-08c6b5e2a147', kind: 'custody_gas',
-    asset_id: '4f602629-b686-457a-b52b-41d900bc4f45', balance: 250000000n,
-    entry_count: 2, last_activity_at: '2026-09-07T22:41:03-06:00' },
-  { account_id: '2b98d51a-77c3-4e60-b0f2-19a4c6e8d532', kind: 'gas_advanced',
-    asset_id: '4f602629-b686-457a-b52b-41d900bc4f45', balance: -250000000n,
-    entry_count: 2, last_activity_at: '2026-09-07T22:41:03-06:00' },
+const API_BASE = '';
+const ENDPOINT = `${API_BASE}/api/test/ledger`;
+const REFRESH_MS = 8000;
+const GLOBAL = '__global__';
+const CUSTOM = '__custom__';
 
-  // Base Sepolia · USDC — one sweep settled, one payment still in custody, fee taken
-  { account_id: '84e0b7c2-15d9-42a8-9f37-6c1e0b5da904', kind: 'custody_unswept',
-    asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', balance: 2000000n,
-    entry_count: 3, last_activity_at: '2026-09-07T23:11:20-06:00' },
-  { account_id: '91f4a3d8-6b02-4c57-8e19-3d7a2c04f6b1', kind: 'custody_treasury',
-    asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', balance: 48500000n,
-    entry_count: 4, last_activity_at: '2026-09-07T22:58:07-06:00' },
-  { account_id: '7c3e9b15-4d80-4a26-b7f1-0e58c2a9d743', kind: 'payable_to_merchant',
-    asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', balance: -49250000n,
-    entry_count: 7, last_activity_at: '2026-09-07T23:11:20-06:00' },
-  { account_id: '5a2d7f60-9c31-4b48-a0e6-b18f3d5c2094', kind: 'fees_receivable',
-    asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', balance: -1250000n,
-    entry_count: 3, last_activity_at: '2026-09-07T23:11:20-06:00' },
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-  // Base Sepolia · ETH — gas float
-  { account_id: 'b6e1c07f-3a95-4d12-8b74-2f9d6e0a5c38', kind: 'custody_gas',
-    asset_id: 'd0a7c934-1b55-4d02-9f6d-7c3e2a91b884', balance: 12000000000000000n,
-    entry_count: 1, last_activity_at: '2026-09-07T20:44:55-06:00' },
-  { account_id: 'c93f5a28-0d67-4e31-9a05-7b2e8c1d4f60', kind: 'gas_advanced',
-    asset_id: 'd0a7c934-1b55-4d02-9f6d-7c3e2a91b884', balance: -12000000000000000n,
-    entry_count: 1, last_activity_at: '2026-09-07T20:44:55-06:00' },
-
-  // Bitcoin signet · BTC — an overpayment that has no invoice to sit against
-  { account_id: 'd47b2e91-5c38-4f60-8a12-9e0d3b7c6a25', kind: 'custody_unswept',
-    asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', balance: 125000n,
-    entry_count: 2, last_activity_at: '2026-09-07T21:59:31-06:00' },
-  { account_id: 'e58c3f02-6a41-4d79-b3e8-0c9a1d5b4726', kind: 'payable_to_merchant',
-    asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', balance: -120000n,
-    entry_count: 1, last_activity_at: '2026-09-07T21:57:12-06:00' },
-  { account_id: 'f61d4a83-7b52-4e08-9c31-1a0b2e6d5847', kind: 'unexplained',
-    asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', balance: -5000n,
-    entry_count: 1, last_activity_at: '2026-09-07T21:59:31-06:00' },
-
-  // Base Sepolia · unregistered contract — dust sent to a deposit address
-  { account_id: '0a5e9c76-2f14-4b83-8d60-5c7a1e9b3d42', kind: 'custody_unsupported',
-    asset_id: 'a9c2f460-3e7b-4a91-8c15-d24f8b0e6733', balance: 1500000000000000000000n,
-    entry_count: 1, last_activity_at: '2026-09-07T19:12:40-06:00' },
-  { account_id: '1b6f0d87-3a25-4c94-9e71-6d8b2f0c4e53', kind: 'unexplained',
-    asset_id: 'a9c2f460-3e7b-4a91-8c15-d24f8b0e6733', balance: -1500000000000000000000n,
-    entry_count: 1, last_activity_at: '2026-09-07T19:12:40-06:00' },
-];
-
-const POSITIONS: Position[] = [
-  { asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', unswept: 500000n, treasury: 0n, gas: 0n,
-    unsupported: 0n, owed_to_merchant: 500000n, fees_owed_by_merchant: 0n, gas_advanced: 0n, unexplained: 0n },
-  { asset_id: '4f602629-b686-457a-b52b-41d900bc4f45', unswept: 0n, treasury: 0n, gas: 250000000n,
-    unsupported: 0n, owed_to_merchant: 0n, fees_owed_by_merchant: 0n, gas_advanced: 250000000n, unexplained: 0n },
-  { asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', unswept: 2000000n, treasury: 48500000n, gas: 0n,
-    unsupported: 0n, owed_to_merchant: 49250000n, fees_owed_by_merchant: 1250000n, gas_advanced: 0n, unexplained: 0n },
-  { asset_id: 'd0a7c934-1b55-4d02-9f6d-7c3e2a91b884', unswept: 0n, treasury: 0n, gas: 12000000000000000n,
-    unsupported: 0n, owed_to_merchant: 0n, fees_owed_by_merchant: 0n, gas_advanced: 12000000000000000n, unexplained: 0n },
-  { asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', unswept: 125000n, treasury: 0n, gas: 0n,
-    unsupported: 0n, owed_to_merchant: 120000n, fees_owed_by_merchant: 0n, gas_advanced: 0n, unexplained: 5000n },
-  { asset_id: 'a9c2f460-3e7b-4a91-8c15-d24f8b0e6733', unswept: 0n, treasury: 0n, gas: 0n,
-    unsupported: 1500000000000000000000n, owed_to_merchant: 0n, fees_owed_by_merchant: 0n,
-    gas_advanced: 0n, unexplained: 1500000000000000000000n },
-];
-
-const RECONCILIATION: Reconciliation[] = [
-  { asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', ledger_unswept: 500000n, queue_active: 500000n,
-    queue_abandoned: 0n, drift: 0n },
-  { asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', ledger_unswept: 2000000n, queue_active: 1000000n,
-    queue_abandoned: 1000000n, drift: 0n },
-  { asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', ledger_unswept: 125000n, queue_active: 120000n,
-    queue_abandoned: 0n, drift: 5000n },
-];
-
-const MOVEMENTS: Movement[] = [
-  {
-    id: '9f2a4c81', event: 'payment.confirmed', status: 'Confirmed', tone: 'ok',
-    occurred_at: '2026-09-07T23:18:49-06:00',
-    invoice_id: 'a14378db-7b22-4e8d-b5f6-e3a02cd35e43',
-    tx_hash: '2aWumRMU5ifChfJnRfYBCzhznF6kUnCXjiAR1CazucwMo5AzPJz2QESw45e6za6UujCNTLAMp58NeRfzDYezAtgv',
-    legs: [
-      { kind: 'custody_unswept', asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', amount: 500000n },
-      { kind: 'payable_to_merchant', asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', amount: -500000n },
-    ],
-  },
-  {
-    id: '7b3d1e05', event: 'payment.detected', status: 'Detected', tone: 'accent',
-    occurred_at: '2026-09-07T23:11:20-06:00',
-    invoice_id: 'c2904f7e-1a63-4b09-8d52-f70ab8c31d64',
-    tx_hash: '0x8f41c7b0d2e95a63f18c04b7ae62d3915c0847fb2e19d6a3c58f07b41e2d9a06',
-    legs: [
-      { kind: 'custody_unswept', asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', amount: 2000000n },
-      { kind: 'payable_to_merchant', asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', amount: -2000000n },
-    ],
-  },
-  {
-    id: '4e8c2a60', event: 'fee.accrued', status: 'Confirmed', tone: 'ok',
-    occurred_at: '2026-09-07T23:11:20-06:00',
-    invoice_id: 'c2904f7e-1a63-4b09-8d52-f70ab8c31d64',
-    legs: [
-      { kind: 'payable_to_merchant', asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', amount: 50000n },
-      { kind: 'fees_receivable', asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', amount: -50000n },
-    ],
-  },
-  {
-    id: '1d09f4b7', event: 'sweep.settled', status: 'Swept', tone: 'ok',
-    occurred_at: '2026-09-07T22:58:07-06:00',
-    tx_hash: '0x53a0e94b7c216fd80a3e5b1972c4d086fa71e3b95d2c604817af35e0b9d1c742',
-    legs: [
-      { kind: 'custody_unswept', asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', amount: -48500000n },
-      { kind: 'custody_treasury', asset_id: 'c81d0a52-6d1e-4f77-9c0a-2a1f5b9c4e30', amount: 48500000n },
-    ],
-  },
-  {
-    id: '6c5b3a92', event: 'deposit.unattributed', status: 'Overpaid', tone: 'warn',
-    occurred_at: '2026-09-07T21:59:31-06:00',
-    tx_hash: 'e7d1c0938ab2f4560e19d7c3ab850f26d41b9e07c3a2f8b5610d94ce27a3b0f8',
-    legs: [
-      { kind: 'custody_unswept', asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', amount: 5000n },
-      { kind: 'unexplained', asset_id: 'f5b3e1c7-9a24-4d18-8b60-6e0c4d7a2f19', amount: -5000n },
-    ],
-  },
-  {
-    id: '3a7e0d14', event: 'gas.funded', status: 'Confirmed', tone: 'ok',
-    occurred_at: '2026-09-07T20:44:55-06:00',
-    tx_hash: '0x1c7b09f4a3e6d258b0c14f97e3a025d68b7c40f1932ae5d80c614b7f2a09e35d',
-    legs: [
-      { kind: 'custody_gas', asset_id: 'd0a7c934-1b55-4d02-9f6d-7c3e2a91b884', amount: 12000000000000000n },
-      { kind: 'gas_advanced', asset_id: 'd0a7c934-1b55-4d02-9f6d-7c3e2a91b884', amount: -12000000000000000n },
-    ],
-  },
-];
-
-/** Movements the fake feed appends, oldest first. */
-const INCOMING: Movement[] = [
-  {
-    id: '0b46e9a3', event: 'payment.detected', status: 'Detected', tone: 'accent',
-    occurred_at: new Date().toISOString(),
-    invoice_id: '5d81b3c0-4f92-4a17-b86e-20c7d9a41f35',
-    tx_hash: '4kQpX2mRt9vLb7Nc3sHy6UzF1wA8dEgJ5PmT0nYrKqSbW3ZxVfC7hLuD2eRa9tGn',
-    legs: [
-      { kind: 'custody_unswept', asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', amount: 1250000n },
-      { kind: 'payable_to_merchant', asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', amount: -1250000n },
-    ],
-  },
-  {
-    id: '8e2c7f15', event: 'fee.accrued', status: 'Confirmed', tone: 'ok',
-    occurred_at: new Date().toISOString(),
-    invoice_id: '5d81b3c0-4f92-4a17-b86e-20c7d9a41f35',
-    legs: [
-      { kind: 'payable_to_merchant', asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', amount: 31250n },
-      { kind: 'fees_receivable', asset_id: 'b2f8fd4c-af4a-4a33-a289-ea2d39a7bf0d', amount: -31250n },
-    ],
-  },
-];
-
-/* ── formatting ────────────────────────────────────────────────────── */
-
-const DISPLAY_FRAC = 8;
-
-const asset = (id: string): Asset =>
-  ASSETS.find((a) => a.id === id) ?? {
-    id, network_type: 'evm', chain_ref: '0', asset_kind: 'contract',
-    address: null, decimals: 0, symbol: null, registered: false,
-  };
-
-const CHAINS: Record<string, string> = {
-  '1': 'Ethereum', '10': 'Optimism', '137': 'Polygon', '8453': 'Base',
-  '42161': 'Arbitrum', '84532': 'Base Sepolia', '11155111': 'Sepolia',
+const EXPLORERS: Record<string, (hash: string) => string> = {
+  'evm:1': (h) => `https://etherscan.io/tx/${h}`,
+  'evm:11155111': (h) => `https://sepolia.etherscan.io/tx/${h}`,
+  'evm:8453': (h) => `https://basescan.org/tx/${h}`,
+  'evm:84532': (h) => `https://sepolia.basescan.org/tx/${h}`,
+  'evm:137': (h) => `https://polygonscan.com/tx/${h}`,
+  'evm:42161': (h) => `https://arbiscan.io/tx/${h}`,
+  'solana:mainnet': (h) => `https://explorer.solana.com/tx/${h}`,
+  'solana:devnet': (h) => `https://explorer.solana.com/tx/${h}?cluster=devnet`,
+  'solana:testnet': (h) => `https://explorer.solana.com/tx/${h}?cluster=testnet`,
 };
 
-function chainLabel(a: Asset): string {
-  if (a.network_type === 'evm') return CHAINS[a.chain_ref] ?? `chain ${a.chain_ref}`;
-  if (a.network_type === 'solana') return `Solana ${a.chain_ref}`;
-  return `Bitcoin ${a.chain_ref}`;
-}
-
-function symbolOf(a: Asset): string {
-  if (a.symbol) return a.symbol;
-  return a.address ? shorten(a.address) : 'UNKNOWN';
-}
-
-function group(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-}
-
-/** Exact base-units → decimal string. No rounding: this is money. */
-function exactAmount(v: bigint, decimals: number): string {
-  const neg = v < 0n;
-  const abs = neg ? -v : v;
-  const base = 10n ** BigInt(decimals);
-  const whole = group((abs / base).toString());
-  const frac = decimals > 0 ? (abs % base).toString().padStart(decimals, '0') : '';
-  return `${neg ? '-' : ''}${whole}${frac ? '.' + frac : ''}`;
-}
-
-/** Trimmed for a column; the exact value goes in the title attribute. */
-function displayAmount(v: bigint, decimals: number): string {
-  const exact = exactAmount(v, decimals);
-  if (decimals <= DISPLAY_FRAC) return exact;
-  const [w, f = ''] = exact.split('.');
-  const cut = f.slice(0, DISPLAY_FRAC);
-  return `${w}.${cut}${f.slice(DISPLAY_FRAC).replace(/0+$/, '') ? '…' : ''}`;
-}
-
-function shorten(s: string, head = 6, tail = 4): string {
-  return s.length <= head + tail + 1 ? s : `${s.slice(0, head)}·${s.slice(-tail)}`;
-}
-
-function clock(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-}
-
-function stamp(iso: string): string {
-  const d = new Date(iso);
-  return `${d.toISOString().slice(0, 10)} ${clock(iso)}`;
-}
-
-const KIND_LABEL: Record<AccountKind, string> = {
-  custody_unswept: 'custody · unswept',
-  custody_treasury: 'custody · treasury',
-  custody_gas: 'custody · gas',
-  custody_unsupported: 'custody · unsupported',
-  payable_to_merchant: 'payable to merchant',
-  fees_receivable: 'fees receivable',
-  gas_advanced: 'gas advanced',
-  unexplained: 'unexplained',
-};
-
-const esc = (s: string): string =>
-  s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string));
-
-function cell(v: bigint, decimals: number): string {
-  const zero = v === 0n;
-  return `<td class="right${zero ? ' zero' : ''}" title="${esc(exactAmount(v, decimals))}">${
-    zero ? '0' : esc(displayAmount(v, decimals))
-  }</td>`;
-}
-
-function statusMark(word: string, tone: StatusTone): string {
-  const cls = tone === 'muted' ? '' : ` status--${tone}`;
-  return `<span class="status${cls}"><span class="dot"></span>${esc(word)}</span>`;
-}
-
-/* ── scope ─────────────────────────────────────────────────────────── */
-
-interface Scope { key: string; text: string; match: (a: Asset) => boolean; }
-
-const SCOPES: Scope[] = [
-  { key: 'all', text: 'All networks', match: () => true },
-  ...Array.from(
-    new Map(ASSETS.map((a) => [`${a.network_type}:${a.chain_ref}`, a])).values(),
-  ).map((a) => ({
-    key: `${a.network_type}:${a.chain_ref}`,
-    text: chainLabel(a),
-    match: (x: Asset) => x.network_type === a.network_type && x.chain_ref === a.chain_ref,
-  })),
+/* Account kinds, in the order they should read on a card. */
+const CUSTODY_KINDS: Array<[keyof PositionRow, string]> = [
+  ['unswept', 'unswept'],
+  ['treasury', 'treasury'],
+  ['gas', 'gas'],
+  ['unsupported', 'unsupported'],
 ];
 
-let scopeKey = 'all';
-const inScope = (assetId: string): boolean =>
-  (SCOPES.find((s) => s.key === scopeKey) ?? SCOPES[0]).match(asset(assetId));
+const OBLIGATION_KINDS: Array<[keyof PositionRow, string]> = [
+  ['fees_owed_by_merchant', 'fees owed'],
+  ['gas_advanced', 'gas advanced'],
+];
 
-/* ── render ────────────────────────────────────────────────────────── */
+/* ---------------------------------------------------------------
+   DOM helpers
+   --------------------------------------------------------------- */
 
-const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
-
-function renderIdent(): void {
-  $('ident').innerHTML = [
-    ['merchant', MERCHANT_ID],
-    ['accounts', `${BALANCES.length} across ${new Set(ASSETS.map((a) => a.network_type)).size} networks`],
-    ['book', 'double-entry · base units'],
-  ]
-    .map(
-      ([k, v]) =>
-        `<div class="data-row"><span class="row-key">${k}</span><span class="row-value">${esc(v)}</span></div>`,
-    )
-    .join('');
+function need<T extends HTMLElement>(selector: string): T {
+  const node = document.querySelector<T>(selector);
+  if (!node) throw new Error(`Missing element: ${selector}`);
+  return node;
 }
 
-function renderScope(): void {
-  $('scope').innerHTML = SCOPES.map(
-    (s) =>
-      `<button type="button" class="choice" role="radio" data-scope="${s.key}" aria-checked="${
-        s.key === scopeKey
-      }">${esc(s.text)}</button>`,
-  ).join('');
-  $('as-of').textContent = `As of ${stamp(new Date().toISOString())}`;
+function el<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className?: string,
+  text?: string,
+): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
 }
 
-function renderCounts(): void {
-  const assets = ASSETS.filter((a) => inScope(a.id));
-  const ids = new Set(assets.map((a) => a.id));
-  const accounts = BALANCES.filter((b) => ids.has(b.asset_id));
-  const entries = accounts.reduce((n, b) => n + b.entry_count, 0);
-  const unregistered = assets.filter((a) => !a.registered).length;
-
-  $('counts').innerHTML = [
-    ['assets held', String(assets.length)],
-    ['accounts open', String(accounts.length)],
-    ['postings', String(entries)],
-    ['unregistered assets', String(unregistered)],
-  ]
-    .map(
-      ([k, v]) =>
-        `<div class="data-row"><span class="row-key">${k}</span><span class="row-value">${v}</span></div>`,
-    )
-    .join('');
+function clear(node: HTMLElement): void {
+  while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-function legsFor(assetId: string): LedgerBalance[] {
-  return BALANCES.filter((b) => b.asset_id === assetId);
+type Tone = 'muted' | 'accent' | 'ok' | 'warn' | 'stop';
+
+function status(word: string, tone: Tone): HTMLElement {
+  const node = el('span', tone === 'muted' ? 'status' : `status status--${tone}`);
+  node.appendChild(el('span', 'dot'));
+  node.appendChild(document.createTextNode(word));
+  return node;
 }
 
-function detailBlock(p: Position, a: Asset): string {
-  const legs = legsFor(a.id);
-  const net = legs.reduce((s, b) => s + b.balance, 0n);
-
-  const legRows = legs
-    .map(
-      (b) => `
-      <div class="leg">
-        <span class="leg-key">${esc(KIND_LABEL[b.kind])}</span>
-        <span class="leg-val" title="${esc(exactAmount(b.balance, a.decimals))}">${esc(
-        displayAmount(b.balance, a.decimals),
-      )} · ${b.entry_count} entr${b.entry_count === 1 ? 'y' : 'ies'}</span>
-      </div>`,
-    )
-    .join('');
-
-  const meta = [
-    ['asset id', shorten(a.id, 8, 4)],
-    ['address', a.address ? shorten(a.address, 10, 6) : 'native'],
-    ['decimals', String(a.decimals)],
-    ['registered', a.registered ? 'yes' : 'no'],
-    ['unsupported', displayAmount(p.unsupported, a.decimals)],
-    ['gas advanced', displayAmount(p.gas_advanced, a.decimals)],
-    ['last activity', legs.length ? stamp(legs.map((b) => b.last_activity_at).sort().reverse()[0]) : '—'],
-  ]
-    .map(
-      ([k, v]) => `<div class="leg"><span class="leg-key">${k}</span><span class="leg-val">${esc(v)}</span></div>`,
-    )
-    .join('');
-
-  const balanced = net === 0n;
-
-  return `
-    <div class="legs">${legRows}
-      <div class="leg leg--net">
-        <span class="leg-key">net</span>
-        <span class="leg-val">${esc(displayAmount(net, a.decimals))} ${statusMark(
-    balanced ? 'Balanced' : 'Drift',
-    balanced ? 'ok' : 'warn',
-  )}</span>
-      </div>
-    </div>
-    <div class="legs legs--meta">${meta}</div>
-    ${
-      a.registered
-        ? ''
-        : '<div class="warning warning--inset">This asset is not registered as a token handler. It is held in custody, excluded from payable, and cannot be swept until a handler exists for it.</div>'
-    }`;
+function dataRow(key: string, value: string, tone?: 'zero' | 'neg'): HTMLElement {
+  const row = el('div', 'data-row');
+  row.appendChild(el('span', 'row-key', key));
+  const cls = tone ? `row-value row-value--${tone}` : 'row-value';
+  row.appendChild(el('span', cls, value));
+  return row;
 }
 
-function renderPositions(): void {
-  const rows = POSITIONS.filter((p) => inScope(p.asset_id));
-  const body = $('positions');
+function kv(key: string, value: string, title?: string): HTMLElement {
+  const row = el('div', 'kv');
+  row.appendChild(el('span', 'row-key', key));
+  const val = el('span', 'row-value', value);
+  if (title) val.title = title;
+  row.appendChild(val);
+  return row;
+}
 
-  if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="8"><div class="empty"><span class="label">No positions</span>
-      <p>Nothing has posted on this network yet. Create an invoice on it and the first confirmed payment opens the accounts.</p></div></td></tr>`;
-    return;
+function cell(text: string, className?: string, title?: string): HTMLTableCellElement {
+  const td = el('td', className, text);
+  if (title) td.title = title;
+  return td;
+}
+
+function table(headers: Array<[string, boolean]>): {
+  wrap: HTMLElement;
+  body: HTMLTableSectionElement;
+} {
+  const wrap = el('div', 'tbl-wrap');
+  const tbl = el('table', 'tbl');
+  const head = el('thead');
+  const tr = el('tr');
+  for (const [label, numeric] of headers) {
+    const th = el('th', numeric ? 'num' : undefined, label);
+    tr.appendChild(th);
+  }
+  head.appendChild(tr);
+  tbl.appendChild(head);
+  const body = el('tbody');
+  tbl.appendChild(body);
+  wrap.appendChild(tbl);
+  return { wrap, body };
+}
+
+function empty(message: string): HTMLElement {
+  return el('p', 'empty', message);
+}
+
+/** A block in a narrow column: title, state word, then a run of facts. */
+function unit(title: string, state: HTMLElement | null, titleHint?: string): HTMLElement {
+  const box = el('div', 'unit');
+  const head = el('div', 'unit-head');
+  const name = el('span', 'unit-title', title);
+  if (titleHint) name.title = titleHint;
+  head.appendChild(name);
+  if (state) head.appendChild(state);
+  box.appendChild(head);
+  return box;
+}
+
+function facts(pairs: Array<[string, string, boolean?]>): HTMLElement {
+  const row = el('div', 'facts');
+  for (const [key, value, dim] of pairs) {
+    const fact = el('span', dim ? 'fact fact--dim' : 'fact');
+    fact.appendChild(el('b', undefined, `${key} `));
+    fact.appendChild(document.createTextNode(value));
+    row.appendChild(fact);
+  }
+  return row;
+}
+
+/* ---------------------------------------------------------------
+   Formatting
+   --------------------------------------------------------------- */
+
+function groupDigits(int: string): string {
+  return int.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/**
+ * Split a minor-unit value into sign and digits. Postgres NUMERIC can arrive
+ * with a zero scale attached ("500000.000000"), so that is trimmed here.
+ * Returns null when the value is not a whole number of minor units.
+ */
+function splitInt(raw: string): { sign: string; digits: string } | null {
+  let s = raw.trim();
+  let sign = '';
+  if (s.startsWith('-')) {
+    sign = '-';
+    s = s.slice(1);
+  } else if (s.startsWith('+')) {
+    s = s.slice(1);
+  }
+  s = s.replace(/\.0+$/, '');
+  if (!/^\d+$/.test(s)) return null;
+  return { sign, digits: s };
+}
+
+/** Minor units to a decimal string. No floats — values can exceed 2^53. */
+function units(raw: string | null | undefined, decimals: number): string {
+  if (raw === null || raw === undefined || raw === '') return '—';
+  const parts = splitInt(raw);
+  if (!parts) return raw;
+  const { sign } = parts;
+  const s = parts.digits;
+
+  const d = Math.max(0, decimals | 0);
+  if (d === 0) return sign + groupDigits(s);
+
+  const padded = s.padStart(d + 1, '0');
+  const int = padded.slice(0, padded.length - d);
+  let frac = padded.slice(padded.length - d).replace(/0+$/, '');
+  const min = Math.min(2, d);
+  while (frac.length < min) frac += '0';
+
+  return sign + groupDigits(int) + (frac ? `.${frac}` : '');
+}
+
+function isZero(raw: string | null | undefined): boolean {
+  if (!raw) return true;
+  const parts = splitInt(raw);
+  if (!parts) return false;
+  return /^0*$/.test(parts.digits);
+}
+
+function toBig(raw: string): bigint {
+  const parts = splitInt(raw);
+  if (!parts) return 0n;
+  try {
+    return BigInt(parts.sign + parts.digits);
+  } catch {
+    return 0n;
+  }
+}
+
+function signed(raw: string, decimals: number): string {
+  const value = units(raw, decimals);
+  if (value === '—' || value.startsWith('-') || isZero(raw)) return value;
+  return `+${value}`;
+}
+
+function pad(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+function timestamp(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  );
+}
+
+function since(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const secs = Math.round((Date.now() - d.getTime()) / 1000);
+  if (secs < 0) return `in ${humanSpan(-secs)}`;
+  if (secs < 10) return 'just now';
+  return `${humanSpan(secs)} ago`;
+}
+
+function humanSpan(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h`;
+  return `${Math.round(secs / 86400)}d`;
+}
+
+function short(value: string | null | undefined, head = 8, tail = 6): string {
+  if (!value) return '—';
+  if (value.length <= head + tail + 1) return value;
+  return `${value.slice(0, head)}…${value.slice(-tail)}`;
+}
+
+function chain(network: string | null, ref: string | null): string {
+  if (!network) return '—';
+  return ref ? `${network} · ${ref}` : network;
+}
+
+function asset(symbol: string | null, assetId: string): string {
+  return symbol ?? `asset ${short(assetId, 8, 4)}`;
+}
+
+function explorerUrl(
+  network: string | null,
+  ref: string | null,
+  hash: string,
+): string | null {
+  if (!network || !ref) return null;
+  const build = EXPLORERS[`${network}:${ref}`];
+  return build ? build(hash) : null;
+}
+
+/* ---------------------------------------------------------------
+   State
+   --------------------------------------------------------------- */
+
+let scope: string | null = null;
+let limit = 60;
+let auto = false;
+let inFlight = false;
+let timer: number | null = null;
+let seenJournals = new Set<string>();
+let suppressReveal = true;
+
+const knownMerchants = new Set<string>();
+
+/* ---------------------------------------------------------------
+   Elements
+   --------------------------------------------------------------- */
+
+const ui = {
+  generatedAt: need('#generated-at'),
+  feedStatus: need('#feed-status'),
+  feedWord: need('#feed-word'),
+  scope: need<HTMLSelectElement>('#scope'),
+  limit: need<HTMLSelectElement>('#limit'),
+  auto: need<HTMLButtonElement>('#auto'),
+  refresh: need<HTMLButtonElement>('#refresh'),
+  customScope: need('#custom-scope'),
+  customId: need<HTMLInputElement>('#custom-id'),
+  customApply: need<HTMLButtonElement>('#custom-apply'),
+  error: need('#error-box'),
+  tags: need('#tags'),
+  positions: need('#positions'),
+  positionsCount: need('#positions-count'),
+  journalsPanel: need('#journals-panel'),
+  journals: need('#journals'),
+  journalsCount: need('#journals-count'),
+  accounts: need('#accounts'),
+  accountsCount: need('#accounts-count'),
+  backlog: need('#backlog'),
+  backlogCount: need('#backlog-count'),
+  reconciliation: need('#reconciliation'),
+};
+
+/* ---------------------------------------------------------------
+   Feed status + errors
+   --------------------------------------------------------------- */
+
+function setFeed(word: string, tone: Tone): void {
+  ui.feedStatus.className = tone === 'muted' ? 'status' : `status status--${tone}`;
+  ui.feedWord.textContent = word;
+}
+
+function restFeed(): void {
+  if (auto) setFeed('Live', 'accent');
+  else setFeed('Idle', 'muted');
+}
+
+function showError(message: string): void {
+  ui.error.textContent = message;
+  ui.error.classList.remove('hidden');
+}
+
+function hideError(): void {
+  ui.error.classList.add('hidden');
+  ui.error.textContent = '';
+}
+
+/* ---------------------------------------------------------------
+   Fetch
+   --------------------------------------------------------------- */
+
+async function load(): Promise<void> {
+  if (inFlight) return;
+  inFlight = true;
+  setFeed('Loading', 'accent');
+
+  const url = new URL(ENDPOINT, window.location.origin);
+  url.searchParams.set('limit', String(limit));
+  if (scope) url.searchParams.set('merchant_id', scope);
+
+  try {
+    const res = await fetch(url.toString(), { headers: { accept: 'application/json' } });
+    if (!res.ok) {
+      const body = (await res.text()).trim();
+      throw new Error(
+        `Request failed with ${res.status}. ${body.slice(0, 240) || 'No detail returned.'}`,
+      );
+    }
+    const data = (await res.json()) as LedgerOverview;
+    hideError();
+    harvestMerchants(data);
+    render(data);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    showError(`The ledger could not be read. ${detail}`);
+  } finally {
+    inFlight = false;
+    restFeed();
+  }
+}
+
+function harvestMerchants(data: LedgerOverview): void {
+  const before = knownMerchants.size;
+  for (const row of data.positions) knownMerchants.add(row.merchant_id);
+  for (const row of data.accounts) knownMerchants.add(row.merchant_id);
+  for (const row of data.journals) knownMerchants.add(row.merchant_id);
+  for (const row of data.sweep_backlog) knownMerchants.add(row.merchant_id);
+  if (data.merchant_id) knownMerchants.add(data.merchant_id);
+  if (knownMerchants.size !== before) syncScopeOptions();
+}
+
+function syncScopeOptions(): void {
+  const current = scope ?? GLOBAL;
+  clear(ui.scope);
+
+  const all = el('option', undefined, 'All merchants');
+  all.value = GLOBAL;
+  ui.scope.appendChild(all);
+
+  for (const id of [...knownMerchants].sort()) {
+    const option = el('option', undefined, id);
+    option.value = id;
+    ui.scope.appendChild(option);
   }
 
-  body.innerHTML = rows
-    .map((p, i) => {
-      const a = asset(p.asset_id);
-      const id = `pos-${i}`;
-      return `
-      <tr>
-        <td>
-          <button type="button" class="row-toggle" data-detail="${id}" aria-expanded="false" aria-controls="${id}">
-            <span class="caret">+</span><span>${esc(symbolOf(a))}</span>
-          </button>
-        </td>
-        <td class="chain">${esc(chainLabel(a))}</td>
-        ${cell(p.unswept, a.decimals)}
-        ${cell(p.treasury, a.decimals)}
-        ${cell(p.gas, a.decimals)}
-        ${cell(p.owed_to_merchant, a.decimals)}
-        ${cell(p.fees_owed_by_merchant, a.decimals)}
-        ${cell(p.unexplained, a.decimals)}
-      </tr>
-      <tr class="detail hidden" id="${id}"><td colspan="8">${detailBlock(p, a)}</td></tr>`;
-    })
-    .join('');
+  const custom = el('option', undefined, 'Enter a merchant ID…');
+  custom.value = CUSTOM;
+  ui.scope.appendChild(custom);
 
-  const drifted = BALANCES.reduce((s, b) => s + (inScope(b.asset_id) ? b.balance : 0n), 0n) !== 0n;
-  const el = $('integrity');
-  el.className = `status status--${drifted ? 'warn' : 'ok'}`;
-  (el.lastElementChild as HTMLElement).textContent = drifted ? 'Drift' : 'Balanced';
+  const values = new Set([GLOBAL, CUSTOM, ...knownMerchants]);
+  ui.scope.value = values.has(current) ? current : GLOBAL;
 }
 
-function renderRecon(): void {
-  const rows = RECONCILIATION.filter((r) => inScope(r.asset_id));
-  const body = $('recon');
+/* ---------------------------------------------------------------
+   Render
+   --------------------------------------------------------------- */
 
-  if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="7"><div class="empty"><span class="label">Nothing unswept</span>
-      <p>No custody is waiting on this network, so there is nothing to reconcile against the sweep queue.</p></div></td></tr>`;
+function render(data: LedgerOverview): void {
+  ui.generatedAt.textContent = timestamp(data.generated_at);
+  renderTags(data);
+  renderPositions(data.positions);
+  renderJournals(data.journals);
+  renderAccounts(data.accounts);
+  renderBacklog(data.sweep_backlog);
+  renderReconciliation(data.reconciliation);
+  suppressReveal = false;
+}
+
+function tag(label: string, value: string, tone?: Tone): HTMLElement {
+  const box = el('div');
+  box.appendChild(el('span', 'label', label));
+  if (tone && tone !== 'muted') {
+    const wrap = el('span', 'tag-value');
+    wrap.appendChild(status(value, tone));
+    box.appendChild(wrap);
   } else {
-    body.innerHTML = rows
-      .map((r) => {
-        const a = asset(r.asset_id);
-        const drift = r.drift !== 0n;
-        return `
-        <tr>
-          <td>${esc(symbolOf(a))}</td>
-          <td class="chain">${esc(chainLabel(a))}</td>
-          ${cell(r.ledger_unswept, a.decimals)}
-          ${cell(r.queue_active, a.decimals)}
-          ${cell(r.queue_abandoned, a.decimals)}
-          ${cell(r.drift, a.decimals)}
-          <td class="right">${statusMark(drift ? 'Drift' : 'Reconciled', drift ? 'warn' : 'ok')}</td>
-        </tr>`;
-      })
-      .join('');
+    box.appendChild(el('span', 'tag-value', value));
   }
-
-  const anyDrift = rows.some((r) => r.drift !== 0n);
-  const el = $('recon-state');
-  el.className = `status status--${anyDrift ? 'warn' : 'ok'}`;
-  (el.lastElementChild as HTMLElement).textContent = anyDrift ? 'Drift' : 'Reconciled';
-
-  $('recon-note').innerHTML = anyDrift
-    ? '<div class="warning">Ledger custody exceeds what the sweep queue is holding. The difference is an unattributed deposit — it stays out of payable until it is matched to an invoice or written to the merchant.</div>'
-    : '<p class="label label--faint">Ledger custody matches the sweep queue</p>';
+  return box;
 }
 
-function movementNode(m: Movement): HTMLElement {
-  const a = asset(m.legs[0].asset_id);
-  const el = document.createElement('article');
-  el.className = 'movement reveal';
+function renderTags(data: LedgerOverview): void {
+  const drifting = data.reconciliation.filter((r) => !isZero(r.drift)).length;
+  const unexplained = data.positions.filter((p) => !isZero(p.unexplained)).length;
 
-  const legs = m.legs
-    .map(
-      (l) => `
-      <div class="leg">
-        <span class="leg-key">${esc(KIND_LABEL[l.kind])}</span>
-        <span class="leg-val" title="${esc(exactAmount(l.amount, asset(l.asset_id).decimals))}">${
-        l.amount > 0n ? '+' : ''
-      }${esc(displayAmount(l.amount, asset(l.asset_id).decimals))} ${esc(symbolOf(asset(l.asset_id)))}</span>
-      </div>`,
-    )
-    .join('');
-
-  const refs: string[] = [`<span class="ref"><b>${clock(m.occurred_at)}</b> · ${esc(chainLabel(a))}</span>`];
-  if (m.invoice_id) refs.push(`<span class="ref">invoice ${esc(shorten(m.invoice_id, 8, 4))}</span>`);
-  if (m.tx_hash) refs.push(`<span class="ref">tx ${esc(shorten(m.tx_hash, 8, 6))}</span>`);
-
-  el.innerHTML = `
-    <div class="movement-head">
-      <span class="movement-event">${esc(m.event)}</span>
-      ${statusMark(m.status, m.tone)}
-    </div>
-    <div class="legs">${legs}</div>
-    <div class="movement-refs">${refs.join('')}</div>`;
-  return el;
-}
-
-function renderMovements(): void {
-  const box = $('postings');
-  const rows = MOVEMENTS.filter((m) => inScope(m.legs[0].asset_id));
-  box.innerHTML = '';
-
-  if (!rows.length) {
-    box.innerHTML = `<div class="empty"><span class="label">No postings</span>
-      <p>Nothing has posted on this network in the last 24 hours. Widen the scope to see the rest of the book.</p></div>`;
-    return;
+  clear(ui.tags);
+  ui.tags.appendChild(
+    tag('Merchant', data.merchant_id ? short(data.merchant_id, 8, 4) : 'All'),
+  );
+  ui.tags.appendChild(tag('Positions', String(data.positions.length)));
+  ui.tags.appendChild(tag('Journals', String(data.journals.length)));
+  ui.tags.appendChild(tag('Awaiting sweep', String(data.sweep_backlog.length)));
+  ui.tags.appendChild(
+    drifting > 0
+      ? tag('Drift', `${drifting} asset${drifting === 1 ? '' : 's'}`, 'stop')
+      : tag('Drift', 'None', 'ok'),
+  );
+  if (unexplained > 0) {
+    ui.tags.appendChild(
+      tag('Unexplained', `${unexplained} asset${unexplained === 1 ? '' : 's'}`, 'warn'),
+    );
   }
-  rows.forEach((m) => box.appendChild(movementNode(m)));
 }
 
-function renderAll(): void {
-  renderCounts();
-  renderPositions();
-  renderRecon();
-  renderMovements();
-}
+/* --- positions -------------------------------------------------------- */
 
-/* ── behaviour ─────────────────────────────────────────────────────── */
+function renderPositions(rows: PositionRow[]): void {
+  clear(ui.positions);
+  ui.positionsCount.textContent = rows.length
+    ? `${rows.length} asset${rows.length === 1 ? '' : 's'}`
+    : '';
 
-document.addEventListener('click', (e) => {
-  const t = e.target as HTMLElement;
-
-  const scopeBtn = t.closest<HTMLButtonElement>('[data-scope]');
-  if (scopeBtn) {
-    scopeKey = scopeBtn.dataset.scope as string;
-    document
-      .querySelectorAll<HTMLElement>('[data-scope]')
-      .forEach((b) => b.setAttribute('aria-checked', String(b.dataset.scope === scopeKey)));
-    renderAll();
+  if (rows.length === 0) {
+    ui.positions.appendChild(
+      empty('No balances yet. Pay a testnet invoice and the first position appears here.'),
+    );
     return;
   }
 
-  const toggle = t.closest<HTMLButtonElement>('[data-detail]');
-  if (toggle) {
-    const row = document.getElementById(toggle.dataset.detail as string);
-    if (!row) return;
-    const open = row.classList.toggle('hidden') === false;
-    toggle.setAttribute('aria-expanded', String(open));
-    const caret = toggle.querySelector('.caret');
-    if (caret) caret.textContent = open ? '−' : '+';
+  for (const row of rows) {
+    const card = el('div', 'card');
+
+    const head = el('div', 'card-head');
+    head.appendChild(el('span', 'card-sym', asset(row.symbol, row.asset_id)));
+    if (row.asset_registered) {
+      head.appendChild(el('span', 'card-net', chain(row.network_type, row.chain_ref)));
+    } else {
+      head.appendChild(status('Unregistered', 'warn'));
+    }
+    card.appendChild(head);
+
+    const headline = el('div', 'headline');
+    headline.appendChild(el('span', 'label', 'Owed to merchant'));
+    headline.appendChild(
+      el('span', 'headline-value', units(row.owed_to_merchant, row.decimals)),
+    );
+    card.appendChild(headline);
+
+    const rowsBox = el('div', 'rows');
+    for (const [key, label] of [...CUSTODY_KINDS, ...OBLIGATION_KINDS]) {
+      const raw = row[key] as string;
+      rowsBox.appendChild(
+        dataRow(label, units(raw, row.decimals), isZero(raw) ? 'zero' : undefined),
+      );
+    }
+    card.appendChild(rowsBox);
+
+    if (!row.asset_registered) {
+      card.appendChild(
+        el(
+          'div',
+          'warning',
+          'This asset is not in the registry. Balances are tracked but not swept.',
+        ),
+      );
+    }
+
+    if (!isZero(row.unexplained)) {
+      card.appendChild(
+        el(
+          'div',
+          'warning warning--stop',
+          `Unexplained balance of ${units(row.unexplained, row.decimals)}. ` +
+            'Custody and obligations do not agree for this asset.',
+        ),
+      );
+    }
+
+    ui.positions.appendChild(card);
+  }
+}
+
+/* --- journals --------------------------------------------------------- */
+
+function journalBalance(entries: EntryRow[]): boolean {
+  const sums = new Map<string, bigint>();
+  for (const entry of entries) {
+    sums.set(entry.asset_id, (sums.get(entry.asset_id) ?? 0n) + toBig(entry.amount));
+  }
+  for (const total of sums.values()) if (total !== 0n) return false;
+  return true;
+}
+
+function renderJournals(rows: JournalRow[]): void {
+  clear(ui.journals);
+  ui.journalsCount.textContent = rows.length
+    ? `${rows.length} shown, newest first`
+    : '';
+
+  if (rows.length === 0) {
+    ui.journals.appendChild(
+      empty('Nothing posted yet. Journals are written when a payment is recognised.'),
+    );
+    return;
+  }
+
+  const next = new Set<string>();
+
+  for (const row of rows) {
+    next.add(row.id);
+    const fresh = !suppressReveal && !seenJournals.has(row.id);
+    const article = el('article', fresh ? 'journal reveal' : 'journal');
+
+    /* head */
+    const head = el('div', 'journal-head');
+    head.appendChild(el('span', 'journal-kind', row.kind));
+
+    const marks = el('div', 'journal-marks');
+    if (row.reverses) marks.appendChild(status('Reversal', 'stop'));
+    marks.appendChild(
+      journalBalance(row.entries) ? status('Balanced', 'ok') : status('Unbalanced', 'stop'),
+    );
+    marks.appendChild(el('span', 'journal-time', timestamp(row.occurred_at)));
+    head.appendChild(marks);
+    article.appendChild(head);
+
+    /* meta */
+    const grid = el('div', 'kv-grid');
+    grid.appendChild(kv('journal', short(row.id, 8, 6), row.id));
+
+    if (row.tx_hash) {
+      const line = el('div', 'kv');
+      line.appendChild(el('span', 'row-key', 'transaction'));
+      const url = explorerUrl(row.network_type, row.chain_ref, row.tx_hash);
+      if (url) {
+        const link = el('a', 'row-value link link--mono', short(row.tx_hash, 10, 8));
+        link.href = url;
+        link.target = '_blank';
+        link.rel = 'noreferrer noopener';
+        link.title = row.tx_hash;
+        line.appendChild(link);
+      } else {
+        const val = el('span', 'row-value', short(row.tx_hash, 10, 8));
+        val.title = row.tx_hash;
+        line.appendChild(val);
+      }
+      grid.appendChild(line);
+    }
+
+    if (row.network_type) grid.appendChild(kv('network', chain(row.network_type, row.chain_ref)));
+    if (row.payment_id) grid.appendChild(kv('payment', short(row.payment_id, 8, 6), row.payment_id));
+    if (!scope) grid.appendChild(kv('merchant', short(row.merchant_id, 8, 4), row.merchant_id));
+    if (row.reverses) grid.appendChild(kv('reverses', short(row.reverses, 8, 6), row.reverses));
+    grid.appendChild(kv('posted', timestamp(row.created_at), `${since(row.created_at)}`));
+    article.appendChild(grid);
+
+    /* entries */
+    if (row.entries.length > 0) {
+      const box = el('div', 'entries');
+      for (const entry of row.entries) {
+        const line = el('div', 'entry');
+        line.appendChild(el('span', 'entry-no', String(entry.entry_no)));
+        line.appendChild(el('span', 'entry-account', entry.account_kind));
+        line.appendChild(
+          el(
+            'span',
+            'entry-asset',
+            `${asset(entry.symbol, entry.asset_id)} · ${chain(entry.network_type, entry.chain_ref)}`,
+          ),
+        );
+        line.appendChild(el('span', 'entry-amount', signed(entry.amount, entry.decimals)));
+        box.appendChild(line);
+      }
+      article.appendChild(box);
+    }
+
+    /* metadata */
+    const meta = metadataTags(row.metadata);
+    if (meta) article.appendChild(meta);
+
+    ui.journals.appendChild(article);
+  }
+
+  seenJournals = next;
+}
+
+function metadataTags(metadata: Record<string, unknown> | null): HTMLElement | null {
+  if (!metadata) return null;
+  const keys = Object.keys(metadata);
+  if (keys.length === 0) return null;
+
+  const wrap = el('div', 'meta-tags');
+  for (const key of keys.sort()) {
+    const value = metadata[key];
+    const printed =
+      value === null || value === undefined
+        ? 'null'
+        : typeof value === 'object'
+          ? JSON.stringify(value)
+          : String(value);
+    const node = el('span', 'meta-tag');
+    node.appendChild(el('b', undefined, `${key} `));
+    node.appendChild(document.createTextNode(printed));
+    wrap.appendChild(node);
+  }
+  return wrap;
+}
+
+/* --- accounts --------------------------------------------------------- */
+
+function renderAccounts(rows: AccountBalanceRow[]): void {
+  clear(ui.accounts);
+  ui.accountsCount.textContent = rows.length ? `${rows.length} open` : '';
+
+  if (rows.length === 0) {
+    ui.accounts.appendChild(empty('Accounts open the first time an asset is posted to.'));
+    return;
+  }
+
+  const { wrap, body } = table([
+    ['Account', false],
+    ['Asset', false],
+    ['Balance', true],
+    ['Last', false],
+  ]);
+
+  for (const row of rows) {
+    const tr = el('tr');
+    tr.appendChild(
+      cell(
+        row.kind,
+        undefined,
+        `account ${row.account_id}\nmerchant ${row.merchant_id}\n${row.entry_count} entries`,
+      ),
+    );
+    tr.appendChild(
+      cell(
+        `${asset(row.symbol, row.asset_id)} · ${row.network_type}`,
+        'dim',
+        `${chain(row.network_type, row.chain_ref)}\n${row.asset_address ?? row.asset_kind}`,
+      ),
+    );
+    tr.appendChild(
+      cell(units(row.balance, row.decimals), isZero(row.balance) ? 'num faint' : 'num'),
+    );
+    tr.appendChild(
+      cell(
+        row.last_activity_at ? since(row.last_activity_at).replace(' ago', '') : '—',
+        'dim',
+        timestamp(row.last_activity_at),
+      ),
+    );
+    body.appendChild(tr);
+  }
+
+  ui.accounts.appendChild(wrap);
+}
+
+/* --- sweep backlog ---------------------------------------------------- */
+
+function backlogStatus(row: SweepBacklogRow): HTMLElement {
+  if (row.max_attempts > 0) return status('Retrying', 'accent');
+  if (!row.next_available_at) return status('Queued', 'muted');
+  const due = new Date(row.next_available_at).getTime();
+  if (!Number.isNaN(due) && due <= Date.now()) return status('Ready', 'accent');
+  return status('Queued', 'muted');
+}
+
+function renderBacklog(rows: SweepBacklogRow[]): void {
+  clear(ui.backlog);
+  ui.backlogCount.textContent = rows.length
+    ? `${rows.length} group${rows.length === 1 ? '' : 's'}`
+    : '';
+
+  if (rows.length === 0) {
+    ui.backlog.appendChild(empty('Nothing waiting. Everything received has been swept.'));
+    return;
+  }
+
+  for (const row of rows) {
+    const hint = row.authority_address
+      ? `${row.custody_address}\nauthority ${row.authority_address}`
+      : row.custody_address;
+    const box = unit(short(row.custody_address, 10, 6), backlogStatus(row), hint);
+
+    box.appendChild(
+      el(
+        'div',
+        'unit-sub',
+        `${asset(row.symbol, row.asset_id)} · ${chain(row.network_type, row.chain_ref)} · ${row.custody_kind}`,
+      ),
+    );
+
+    const pairs: Array<[string, string, boolean?]> = [
+      ['amount', units(row.total_amount, row.decimals)],
+      ['movements', String(row.movement_count)],
+    ];
+    if (row.oldest_enqueued_at) pairs.push(['waiting', since(row.oldest_enqueued_at)]);
+    if (row.max_attempts > 0) pairs.push(['attempts', String(row.max_attempts)]);
+    box.appendChild(facts(pairs));
+
+    ui.backlog.appendChild(box);
+  }
+}
+
+/* --- reconciliation --------------------------------------------------- */
+
+function renderReconciliation(rows: ReconciliationRow[]): void {
+  clear(ui.reconciliation);
+
+  if (rows.length === 0) {
+    ui.reconciliation.appendChild(
+      empty('Nothing to reconcile until custody holds an unswept balance.'),
+    );
+    return;
+  }
+
+  for (const row of rows) {
+    const clean = isZero(row.drift);
+    const box = unit(
+      `${asset(row.symbol, row.asset_id)} · ${chain(row.network_type, row.chain_ref)}`,
+      clean ? status('Matched', 'ok') : status('Drift', 'stop'),
+    );
+
+    const pairs: Array<[string, string, boolean?]> = [
+      ['ledger', units(row.ledger_unswept, row.decimals)],
+      ['queue', units(row.queue_active, row.decimals)],
+      ['drift', signed(row.drift, row.decimals), clean],
+    ];
+    if (!isZero(row.queue_abandoned)) {
+      pairs.splice(2, 0, ['abandoned', units(row.queue_abandoned, row.decimals)]);
+    }
+    box.appendChild(facts(pairs));
+
+    ui.reconciliation.appendChild(box);
+  }
+}
+
+/* ---------------------------------------------------------------
+   Controls
+   --------------------------------------------------------------- */
+
+function setScope(next: string | null): void {
+  scope = next;
+  seenJournals = new Set();
+  suppressReveal = true;
+  void load();
+}
+
+function showCustom(on: boolean): void {
+  ui.customScope.classList.toggle('hidden', !on);
+  ui.customApply.classList.toggle('hidden', !on);
+}
+
+ui.scope.addEventListener('change', () => {
+  const value = ui.scope.value;
+  if (value === CUSTOM) {
+    showCustom(true);
+    ui.customId.focus();
+    return;
+  }
+  showCustom(false);
+  setScope(value === GLOBAL ? null : value);
+});
+
+function applyCustom(): void {
+  const value = ui.customId.value.trim();
+  if (!UUID_RE.test(value)) {
+    showError('That is not a merchant ID. Paste the UUID shown when the account was created.');
+    ui.customId.focus();
+    return;
+  }
+  hideError();
+  knownMerchants.add(value);
+  syncScopeOptions();
+  ui.scope.value = value;
+  showCustom(false);
+  setScope(value);
+}
+
+ui.customApply.addEventListener('click', applyCustom);
+ui.customId.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    applyCustom();
   }
 });
 
-/* Fake feed. Replace with the SSE/WebSocket stream that already drives observation. */
-let pending = 0;
-function stream(): void {
-  const next = INCOMING[pending];
-  if (!next) return;
-  pending += 1;
+ui.limit.addEventListener('change', () => {
+  limit = Number(ui.limit.value) || 60;
+  void load();
+});
 
-  const m: Movement = { ...next, occurred_at: new Date().toISOString() };
-  MOVEMENTS.unshift(m);
+ui.refresh.addEventListener('click', () => void load());
 
-  if (inScope(m.legs[0].asset_id)) {
-    const box = $('postings');
-    box.querySelector('.empty')?.remove();
-    box.prepend(movementNode(m));
+function setAuto(on: boolean): void {
+  auto = on;
+  ui.auto.textContent = on ? 'Auto refresh on' : 'Auto refresh off';
+  ui.auto.classList.toggle('is-on', on);
+  ui.auto.setAttribute('aria-pressed', String(on));
+
+  /* One live region per view — the journals panel, while it is changing. */
+  ui.journalsPanel.classList.toggle('is-live', on);
+
+  if (timer !== null) {
+    window.clearInterval(timer);
+    timer = null;
   }
-  window.setTimeout(stream, 7000);
+  if (on) timer = window.setInterval(() => void load(), REFRESH_MS);
+
+  restFeed();
 }
 
-renderIdent();
-renderScope();
-renderAll();
-window.setTimeout(stream, 5000);
+ui.auto.addEventListener('click', () => setAuto(!auto));
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !auto) return;
+  void load();
+});
+
+/* ---------------------------------------------------------------
+   Boot
+   --------------------------------------------------------------- */
+
+const initial = new URLSearchParams(window.location.search).get('merchant_id');
+if (initial && UUID_RE.test(initial)) {
+  scope = initial;
+  knownMerchants.add(initial);
+  syncScopeOptions();
+}
+
+ui.auto.setAttribute('aria-pressed', 'false');
+void load();

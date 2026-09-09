@@ -96,7 +96,8 @@ async fn main() {
         .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))
         .route("/api/test/networks", get(api::tests::list_networks_test_handler))
         .route("/api/test/merchants", get(api::tests::list_merchants_test_handler))
-
+        .route("/api/test/ledger", get(api::tests::ledger_overview_test_handler))
+        
         // Middleware
         .fallback_service(ServeDir::new("wwwroot"))
         .layer(cors)

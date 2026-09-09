@@ -104,7 +104,17 @@ impl AddressKind {
             AddressKind::Operator => "operator",
         }
     }
-
+    pub fn from_db(s: &str) -> Option<Self> {
+        match s {
+            "external" => Some(AddressKind::External),
+            "deposit_address" => Some(AddressKind::DepositAddress),
+            "vault" => Some(AddressKind::Vault),
+            "merchant_main" => Some(AddressKind::MerchantMain),
+            "gas" => Some(AddressKind::Gas),
+            "operator" => Some(AddressKind::Operator),
+            _ => None,
+        }
+    }
     /// Which custody account value at this kind of address lands in.
     fn custody_account(self) -> Option<&'static str> {
         match self {
@@ -116,14 +126,16 @@ impl AddressKind {
     }
 }
 
-/// Mirrors `payments.payment_path`. `Direct` = deposit address, sweep needed.
-/// `Reference` = straight to treasury, no sweep (LEDGER.md §5.3).
+/// Mirrors `payments.payment_path`. Says how the payment was *identified*:
+/// `Direct` = it hit a per-invoice deposit address, `Reference` = it carried
+/// an invoice identifier (vault log, Solana reference key). It says nothing
+/// about where the value sits — that is `to_kind` on the movement, and the
+/// Ledgerer books custody from that, never from this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentPath {
     Direct,
     Reference,
 }
-
 impl PaymentPath {
     pub fn from_db(s: &str) -> Option<Self> {
         match s {
@@ -187,6 +199,7 @@ pub struct ObservedInbound {
 
 /// Where recognized value physically sits and who can sign for it
 /// (LEDGER.md §2.8). Only needed for `PaymentPath::Direct`.
+/// Only needed when the value landed in custody_unswept (deposit address or vault). and MissingCustody Display: "payment {payment_id} landed in custody_unswept but no Custody was supplied".
 #[derive(Debug, Clone)]
 pub struct Custody {
     pub address: String,
@@ -270,6 +283,11 @@ pub enum LedgerError {
     /// A sweep row for this value is claimed or broadcast. Value just vanished
     /// under a sweep in flight; this is not something to clean up quietly.
     SweepInFlight { payment_id: Uuid, rows: i64 },
+    /// Movements for one payment landed at more than one kind of address.
+    MixedCustody { payment_id: Uuid },
+    /// The movement's `to_kind` has no custody account (external/operator/NULL).
+    /// The connector classified the destination wrong.
+    NoCustodyAccount { payment_id: Uuid, to_kind: Option<String> },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -301,6 +319,13 @@ impl std::fmt::Display for LedgerError {
             LedgerError::SweepInFlight { payment_id, rows } => write!(
                 f,
                 "ALARM: payment {payment_id} orphaned while {rows} sweep row(s) are claimed/broadcast"
+            ),
+            LedgerError::MixedCustody { payment_id } => {
+                write!(f, "payment {payment_id} movements landed at more than one address kind")
+            }
+            LedgerError::NoCustodyAccount { payment_id, to_kind } => write!(
+                f,
+                "payment {payment_id} landed at to_kind {to_kind:?}, which has no custody account"
             ),
         }
     }
@@ -469,10 +494,13 @@ impl Ledgerer {
     ///
     /// - chain_transactions → `final`, block_time stamped
     /// - one `payment_recognized` journal behind `payment_recognized:<payment_id>`
-    /// - value legs into custody_unswept (direct) or custody_treasury
-    ///   (reference, or already swept), against payable_to_merchant
+    /// - value legs into the custody account implied by the movement's
+    ///   `to_kind` (deposit_address/vault → custody_unswept,
+    ///   merchant_main → custody_treasury), against payable_to_merchant.
+    ///   `payment_path` is snapshotted into metadata only.
     /// - fee legs at the route's resolved rate, if the fee rounds above zero
-    /// - one sweep_queue row per movement, direct path only, not already swept
+    /// - one sweep_queue row per movement whenever value landed in custody_unswept
+    ///   and was not already swept
     pub async fn recognize_payment(
         &self,
         conn: &mut PgConnection,
@@ -518,7 +546,26 @@ impl Ledgerer {
         }
         let amount: Decimal = movements.iter().map(|m| m.amount).sum();
 
-        // 3. Custody account: where does the value get booked?
+
+
+        // 3. Custody account: where does the value physically sit? Decided by
+        //    the movement's to_kind, never by payment_path. A vault Payment log
+        //    and a deposit-address transfer are both "unswept" — the vault
+        //    holds `_vault[token][merchant]` until sweep(token) is called. A
+        //    Solana reference payment straight into the merchant's ATA is
+        //    "treasury".
+        let to_kind = movements[0].to_kind.as_deref();
+        if movements.iter().any(|m| m.to_kind.as_deref() != to_kind) {
+            return Err(LedgerError::MixedCustody { payment_id: input.payment_id });
+        }
+        let landed_in = to_kind
+            .and_then(AddressKind::from_db)
+            .and_then(AddressKind::custody_account)
+            .ok_or_else(|| LedgerError::NoCustodyAccount {
+                payment_id: input.payment_id,
+                to_kind: to_kind.map(str::to_owned),
+            })?;
+
         let asset_registered: bool =
             sqlx::query_scalar("SELECT registered FROM assets WHERE id = $1")
                 .bind(asset_id)
@@ -530,15 +577,13 @@ impl Ledgerer {
         } else if input.already_swept {
             ("custody_treasury", false) // §10.1: already in treasury
         } else {
-            match input.path {
-                PaymentPath::Direct => ("custody_unswept", true),
-                PaymentPath::Reference => ("custody_treasury", false),
-            }
+            (landed_in, landed_in == "custody_unswept")
         };
 
         if enqueue && input.custody.is_none() {
             return Err(LedgerError::MissingCustody { payment_id: input.payment_id });
         }
+
 
         // 4. Fee rate, resolved at occurred_at, snapshotted into metadata.
         let (occurred_at, exact) = match block_time {

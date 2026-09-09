@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::sleep;
 use serde_json::{json, Map, Value};
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 
 use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
@@ -16,6 +16,12 @@ use sha3::{Digest, Keccak256};
 use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
+
+use chrono::{DateTime, Utc};
+use crate::ledgerer::{
+    AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
+    ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
+};
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -173,13 +179,66 @@ fn address_to_topic(addr_lc: &str) -> String {
     format!("0x{:0>64}", addr_lc.trim_start_matches("0x"))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Views over chain data (changed: from-address, log_index, timestamp)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A top-level value transfer. `from_lc` is `tx.from`, informational only —
+/// it becomes `chain_movements.from_address`, which is nullable, never a key.
+struct NativeTransfer {
+    tx_hash: String,
+    from_lc: String,
+    to_lc: String,
+    value: u128,
+}
+
 struct Erc20Transfer {
     tx_hash: String,
+    /// Position in the block's log list. Feeds `event_index`.
+    log_index: u64,
     token_lc: String,
+    from_lc: String,
     to_lc: String,
     amount: u128,
-    pub block_hash: String
+    pub block_hash: String,
 }
+
+
+/// One canonical block, only the bits we need.
+struct BlockView {
+    number: u64,
+    hash: String,
+    parent_hash: String,
+    /// `block.timestamp`, seconds since epoch. Stamped onto
+    /// chain_transactions.block_time so recognition resolves the fee rate at the
+    /// moment the money landed and records `occurred_at_exact = true`.
+    timestamp: Option<i64>,
+    transfers: Vec<NativeTransfer>,
+}
+
+impl BlockView {
+    fn block_time(&self) -> Option<DateTime<Utc>> {
+        self.timestamp.and_then(|t| DateTime::from_timestamp(t, 0))
+    }
+}
+
+/// One attributed credit inside one transaction. Everything the payments
+/// insert and the chain_movements row need, resolved once by the caller.
+struct Credit<'a> {
+    inv: &'a WatchedInvoice,
+    amount: Decimal,
+    path: PaymentPath,
+    asset: AssetKey,
+    event_index: i32,
+    event_ref: String,
+    from_lc: Option<String>,
+    to_lc: String,
+    to_kind: AddressKind,
+    /// Path-specific webhook fields (TokenAddress, Payer…). The common ones
+    /// are added in `apply_credits`.
+    extra: Map<String, Value>,
+}
+
 fn payment_topic0() -> &'static str {
     static TOPIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TOPIC.get_or_init(|| {
@@ -311,16 +370,11 @@ struct WatchedInvoice {
     amount_requested: rust_decimal::Decimal,
     required_confirmations: i64,
     created_block: Option<i64>,
+    /// ERC-20 contract address, lowercase. None => native. Log matching only.
     token_lc: Option<String>,
-}
-
-/// One canonical block, only the bits we need.
-struct BlockView {
-    number: u64,
-    hash: String,
-    parent_hash: String,
-    /// (tx_hash, to_lc, value_wei)
-    transfers: Vec<(String, String, u128)>,
+    /// Ledger route identifier. Not an address — this is what the Ledgerer
+    /// resolves fee rates and treasury accounts against.
+    token_id: String,
 }
 
 // ==========================================
@@ -328,12 +382,13 @@ struct BlockView {
 // ==========================================
 pub struct EVMNetwork {
     chain_id: u64,
-    pub network_name: String,   // "EVM_84532" — DB key, never shown to payers
-    display_name: String,       // "Base Sepolia" — safe for the checkout page
+    pub network_name: String,
+    display_name: String,
     rpc_urls: Vec<String>,
     pub contract_address: Option<String>,
     client: reqwest::Client,
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
+    ledger: Ledgerer,
 }
 
 impl EVMNetwork {
@@ -354,6 +409,33 @@ impl EVMNetwork {
             contract_address,
             client: reqwest::Client::new(),
             pending: Mutex::new(HashMap::new()),
+            ledger: Ledgerer::new(),
+        }
+    }
+
+    fn chain(&self) -> ChainRef {
+        ChainRef::new(NETWORK_TYPE, self.chain_ref())
+    }
+
+    /// `chain_movements.event_index` for EVM.
+    ///
+    /// The top-level value transfer is ordinal 0; a log is `log_index + 1`.
+    /// One tx has at most one top-level value transfer and its log indices are
+    /// fixed by the block, so this is stable across replays and a tx that both
+    /// sends ETH and emits Transfer logs can never collide on (tx_id, event_index).
+    fn event_index_value() -> (i32, String) {
+        (0, "value".to_string())
+    }
+    fn event_index_log(log_index: u64) -> (i32, String) {
+        ((log_index + 1) as i32, format!("log:{log_index}"))
+    }
+
+    /// Token address must already be lowercase hex — the Ledgerer looks it up
+    /// verbatim. `None` => native.
+    fn asset_for(&self, token_lc: Option<&str>) -> AssetKey {
+        match token_lc {
+            Some(t) => AssetKey::contract(self.chain(), t),
+            None => AssetKey::native(self.chain()),
         }
     }
 
@@ -432,34 +514,39 @@ impl EVMNetwork {
     }
 
     fn parse_block(raw: &serde_json::Value) -> Result<BlockView, String> {
-        let number = raw.get("number").and_then(|v| v.as_str())
-            .map(hex_to_u64).ok_or("block missing number")?;
-        let hash = raw.get("hash").and_then(|v| v.as_str())
-            .ok_or("block missing hash")?.to_lowercase();
-        let parent_hash = raw.get("parentHash").and_then(|v| v.as_str())
-            .unwrap_or_default().to_lowercase();
+        let number      = hex_to_u64(raw["number"].as_str().ok_or("block: no number")?);
+        let hash        = raw["hash"].as_str().ok_or("block: no hash")?.to_lowercase();
+        let parent_hash = raw["parentHash"].as_str().ok_or("block: no parentHash")?.to_lowercase();
+
+        // Absent only on provider-side pending blocks. None is survivable: recognition
+        // falls back to now() and marks occurred_at_exact = false.
+        let timestamp = raw["timestamp"].as_str().map(|t| hex_to_u64(t) as i64);
 
         let mut transfers = Vec::new();
-        if let Some(txs) = raw.get("transactions").and_then(|v| v.as_array()) {
+        if let Some(txs) = raw["transactions"].as_array() {
             for tx in txs {
-                // Contract creations have `to: null` — nothing to match.
-                let to = match tx.get("to").and_then(|v| v.as_str()) {
-                    Some(t) => t.to_lowercase(),
-                    None => continue,
+                // full = false yields bare hash strings; nothing to match on.
+                let (Some(tx_hash), Some(from), Some(to)) =
+                    (tx["hash"].as_str(), tx["from"].as_str(), tx["to"].as_str())
+                else {
+                    continue; // contract creation has to = null
                 };
-                let value = tx.get("value").and_then(|v| v.as_str())
-                    .map(hex_to_u128).transpose()?.unwrap_or(0);
+                let value = hex_to_u128(
+                    tx["value"].as_str().unwrap_or("0").trim_start_matches("0x"),
+                ).unwrap_or(0);
                 if value == 0 {
-                    continue; // ERC-20 transfers land in watch_logs, not here.
+                    continue;
                 }
-                let tx_hash = match tx.get("hash").and_then(|v| v.as_str()) {
-                    Some(h) => h.to_lowercase(),
-                    None => continue,
-                };
-                transfers.push((tx_hash, to, value));
+                transfers.push(NativeTransfer {
+                    tx_hash: tx_hash.to_lowercase(),
+                    from_lc: from.to_lowercase(),
+                    to_lc:   to.to_lowercase(),
+                    value,
+                });
             }
         }
-        Ok(BlockView { number, hash, parent_hash, transfers })
+
+        Ok(BlockView { number, hash, parent_hash, timestamp, transfers })
     }
 
 
@@ -479,6 +566,417 @@ impl EVMNetwork {
         let bh = raw.get("blockHash").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
         Ok(Some((bn, bh)))
     }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Detection: one DB transaction per chain transaction
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Record every credit a chain transaction produced, and return the
+    /// invoices it touched so the caller recomputes each once.
+    ///
+    /// One database transaction for the whole tx hash. That matters because a
+    /// tx that pays two invoices (a batching router hitting two deposit
+    /// addresses) must land both credits or neither — a half commit leaves one
+    /// invoice permanently short with nothing left to rescan.
+    ///
+    /// Idempotent on (invoice_id, tx_hash). Rescans hit ON CONFLICT and do
+    /// nothing; the only UPDATE that fires is relocation (block changed) or
+    /// resurrection (orphaned and re-landed). The amount is never rewritten.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_credits(
+        &self,
+        pool: &PgPool,
+        tx_hash: &str,
+        block_number: i64,
+        block_hash: &str,
+        block_time: Option<DateTime<Utc>>,
+        credits: &[Credit<'_>],
+    ) -> Result<Vec<Uuid>, String> {
+        if credits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut db_tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("apply_credits begin tx: {e}"))?;
+
+        let mut touched = Vec::with_capacity(credits.len());
+        let mut transfers = Vec::with_capacity(credits.len());
+
+        for c in credits {
+            let inv = c.inv;
+
+            let inserted: Option<Uuid> = sqlx::query_scalar(
+                r#"
+                INSERT INTO payments
+                    (invoice_id, tx_hash, amount, block_number, block_hash,
+                     confirmations, status, payment_path)
+                VALUES ($1, $2, $3, $4, $5, 0, 'detected', $6)
+                ON CONFLICT (invoice_id, tx_hash) DO NOTHING
+                RETURNING id
+                "#,
+            )
+                .bind(inv.invoice_id)
+                .bind(tx_hash)
+                .bind(c.amount)
+                .bind(block_number)
+                .bind(block_hash)
+                .bind(c.path.as_str())
+                .fetch_optional(&mut *db_tx)
+                .await
+                .map_err(|e| format!("insert payment: {e}"))?;
+
+            let payment_id = match inserted {
+                Some(id) => {
+                    println!(
+                        "[{}] detected {} base units via {} path -> {} (invoice {}, merchant {}, tx {}, block {})",
+                        self.network_name, c.amount, c.path.as_str(), c.to_lc,
+                        inv.invoice_id, inv.merchant_id, tx_hash, block_number
+                    );
+
+                    let mut fields = c.extra.clone();
+                    fields.insert("TxHash".into(), json!(tx_hash));
+                    fields.insert("AmountBaseUnits".into(), json!(c.amount.to_string()));
+                    fields.insert("BlockNumber".into(), json!(block_number));
+                    fields.insert("BlockHash".into(), json!(block_hash));
+                    fields.insert("PaymentPath".into(), json!(c.path.as_str()));
+                    fields.insert("Confirmations".into(), json!(0));
+
+                    // webhook_events is UNIQUE (merchant_id, dedupe_key). A bare
+                    // tx_hash collides when one tx pays two invoices of the same
+                    // merchant. Scope to event type + subject.
+                    let dedupe_key = format!("payment.detected:{}:{}", inv.invoice_id, tx_hash);
+                    enqueue_webhook(&mut db_tx, inv.invoice_id, "payment.detected", &dedupe_key, fields)
+                        .await?;
+                    id
+                }
+                None => {
+                    // Seen before. Relocate if the block changed (re-mined after
+                    // a reorg) and resurrect if we had orphaned it. Amount stays.
+                    sqlx::query(
+                        r#"
+                        UPDATE payments
+                           SET block_number = $2,
+                               block_hash   = $3,
+                               status       = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
+                               payment_path = COALESCE(payment_path, $5),
+                               updated_at   = now()
+                         WHERE invoice_id = $1
+                           AND tx_hash = $4
+                           AND (block_hash <> $3 OR status = 'orphaned')
+                        "#,
+                    )
+                        .bind(inv.invoice_id)
+                        .bind(block_number)
+                        .bind(block_hash)
+                        .bind(tx_hash)
+                        .bind(c.path.as_str())
+                        .execute(&mut *db_tx)
+                        .await
+                        .map_err(|e| format!("relocate payment: {e}"))?;
+
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT id FROM payments WHERE invoice_id = $1 AND tx_hash = $2",
+                    )
+                        .bind(inv.invoice_id)
+                        .bind(tx_hash)
+                        .fetch_one(&mut *db_tx)
+                        .await
+                        .map_err(|e| format!("fetch payment id: {e}"))?
+                }
+            };
+
+            transfers.push(ObservedTransfer {
+                event_index: c.event_index,
+                event_ref: Some(c.event_ref.clone()),
+                asset: c.asset.clone(),
+                amount: c.amount,
+                from_address: c.from_lc.clone(),
+                from_kind: Some(AddressKind::External),
+                to_address: Some(c.to_lc.clone()),
+                to_kind: Some(c.to_kind),
+                merchant_id: Some(inv.merchant_id),
+                invoice_id: Some(inv.invoice_id),
+                payment_id: Some(payment_id),
+                token_id: Some(inv.token_id.clone()),
+            });
+
+            touched.push(inv.invoice_id);
+        }
+
+        // A tx paying invoices of two different merchants has merchant_id = None
+        // on the tx row; the movements carry their own.
+        let tx_merchant = {
+            let first = credits[0].inv.merchant_id;
+            credits.iter().all(|c| c.inv.merchant_id == first).then_some(first)
+        };
+
+        // Chain layer, same transaction. Also what flips an orphaned
+        // chain_transactions row back to 'detected' when the tx re-lands.
+        self.ledger
+            .record_detected(
+                &mut *db_tx,
+                &ObservedInbound {
+                    chain: self.chain(),
+                    tx_hash: tx_hash.to_string(),
+                    block_number: Some(block_number),
+                    block_hash: Some(block_hash.to_string()),
+                    block_time,
+                    merchant_id: tx_merchant,
+                    token_id: None, // observed, not initiated; route is on each movement
+                    transfers,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        db_tx
+            .commit()
+            .await
+            .map_err(|e| format!("apply_credits commit tx: {e}"))?;
+
+        Ok(touched)
+    }
+
+    /// Credit every native transfer in this block that lands on a watched address.
+    async fn apply_block(
+        &self,
+        pool: &PgPool,
+        block: &BlockView,
+        by_address: &HashMap<String, Vec<WatchedInvoice>>,
+    ) -> Result<(), String> {
+        let block_time = block.block_time();
+        let mut touched: HashMap<Uuid, &WatchedInvoice> = HashMap::new();
+
+        for t in &block.transfers {
+            // A zero-value call to a deposit address moved nothing; recording it
+            // would be a payment row with a zero movement.
+            if t.value == 0 {
+                continue;
+            }
+            let Some(invoices) = by_address.get(&t.to_lc) else { continue };
+            let amount = wei_to_decimal(t.value)?;
+            let (event_index, event_ref) = Self::event_index_value();
+
+            let credits: Vec<Credit> = invoices
+                .iter()
+                .filter(|inv| {
+                    // Native-value only — a token invoice at this address must
+                    // never be credited from a plain ETH transfer.
+                    inv.token_lc.is_none()
+                        && inv.created_block.map_or(true, |c| (block.number as i64) >= c)
+                })
+                .map(|inv| Credit {
+                    inv,
+                    amount,
+                    path: PaymentPath::Direct,
+                    asset: self.asset_for(None),
+                    event_index,
+                    event_ref: event_ref.clone(),
+                    from_lc: Some(t.from_lc.clone()),
+                    to_lc: t.to_lc.clone(),
+                    to_kind: AddressKind::DepositAddress,
+                    extra: Map::new(),
+                })
+                .collect();
+
+            for id in self
+                .apply_credits(pool, &t.tx_hash, block.number as i64, &block.hash, block_time, &credits)
+                .await?
+            {
+                if let Some(inv) = credits.iter().find(|c| c.inv.invoice_id == id) {
+                    touched.insert(id, inv.inv);
+                }
+            }
+        }
+
+        for (id, inv) in touched {
+            self.recompute_invoice_totals(pool, id, std::slice::from_ref(inv)).await?;
+        }
+        Ok(())
+    }
+
+    /// Credit ERC-20 Transfer logs onto watched deposit addresses. `transfers`
+    /// are already filtered to this block's hash by the caller.
+    async fn apply_erc20_transfers(
+        &self,
+        pool: &PgPool,
+        block: &BlockView,
+        transfers: &[Erc20Transfer],
+        by_address: &HashMap<String, Vec<WatchedInvoice>>,
+    ) -> Result<(), String> {
+        let block_time = block.block_time();
+
+        // Group by tx so a router that fans one tx out to two deposit addresses
+        // lands both credits in one DB transaction.
+        let mut by_tx: HashMap<&str, Vec<Credit>> = HashMap::new();
+
+        for t in transfers {
+            if t.amount == 0 {
+                continue;
+            }
+            let Some(invoices) = by_address.get(&t.to_lc) else { continue };
+            let amount = wei_to_decimal(t.amount)?;
+            let (event_index, event_ref) = Self::event_index_log(t.log_index);
+
+            for inv in invoices {
+                // Only credit invoices that expect exactly this token.
+                let Some(expected) = inv.token_lc.as_deref() else { continue };
+                if expected != t.token_lc {
+                    continue;
+                }
+                if let Some(c) = inv.created_block {
+                    if (block.number as i64) < c {
+                        continue;
+                    }
+                }
+
+                let mut extra = Map::new();
+                extra.insert("TokenAddress".into(), json!(t.token_lc));
+
+                by_tx.entry(t.tx_hash.as_str()).or_default().push(Credit {
+                    inv,
+                    amount,
+                    path: PaymentPath::Direct,
+                    asset: self.asset_for(Some(&t.token_lc)),
+                    event_index,
+                    event_ref: event_ref.clone(),
+                    from_lc: Some(t.from_lc.clone()),
+                    to_lc: t.to_lc.clone(),
+                    to_kind: AddressKind::DepositAddress,
+                    extra,
+                });
+            }
+        }
+
+        let mut touched: HashMap<Uuid, &WatchedInvoice> = HashMap::new();
+        for (tx_hash, credits) in &by_tx {
+            for id in self
+                .apply_credits(pool, tx_hash, block.number as i64, &block.hash, block_time, credits)
+                .await?
+            {
+                if let Some(c) = credits.iter().find(|c| c.inv.invoice_id == id) {
+                    touched.insert(id, c.inv);
+                }
+            }
+        }
+
+        for (id, inv) in touched {
+            self.recompute_invoice_totals(pool, id, std::slice::from_ref(inv)).await?;
+        }
+        Ok(())
+    }
+
+    /// Vault `Payment` log: the WalletConnect / smart-contract path.
+    ///
+    /// The vault does NOT forward. `pay()`/`payNative()` credit
+    /// `_vault[token][merchant]` and the value stays in the contract until the
+    /// merchant wallet calls `sweep(token)`. So the movement names the vault as
+    /// destination and the Ledgerer books it to custody_unswept with a sweep
+    /// row; the sweep is a contract call signed by the merchant wallet, not an
+    /// EOA transfer (see the Vault arm in refresh_confirmations).
+    async fn apply_payment_log(
+        &self,
+        pool: &PgPool,
+        log: &Log,
+        by_id: &HashMap<Uuid, WatchedInvoice>,
+        vault_lc: &str,
+        block_time: Option<DateTime<Utc>>,
+    ) -> Result<(), String> {
+        if log.removed {
+            return Ok(()); // reorg-removed entry from a lagging provider; reorg path owns this
+        }
+
+        let ev = match decode_payment_log(log) {
+            Ok(ev) => ev,
+            Err(e) => {
+                eprintln!("[{}] skipping undecodable Payment log {}: {e}", self.network_name, log.transaction_hash);
+                return Ok(());
+            }
+        };
+
+        let Some(inv) = by_id.get(&ev.invoice_id) else {
+            return Ok(());
+        };
+
+        if inv.merchant_wallet_lc != ev.merchant_lc {
+            eprintln!(
+                "[{}] Payment log for invoice {} credits wrong merchant {} (expected {}), ignoring",
+                self.network_name, ev.invoice_id, ev.merchant_lc, inv.merchant_wallet_lc
+            );
+            return Ok(());
+        }
+
+        let expected_token: &str = inv.token_lc.as_deref().unwrap_or(NATIVE_TOKEN_SENTINEL);
+        if expected_token != ev.token_lc {
+            eprintln!(
+                "[{}] Payment log for invoice {} paid in wrong token {} (expected {}), ignoring",
+                self.network_name, ev.invoice_id, ev.token_lc, expected_token
+            );
+            return Ok(());
+        }
+
+        let block_number = hex_to_u64(&log.block_number) as i64;
+        let block_hash = log.block_hash.to_lowercase();
+        let tx_hash = log.transaction_hash.to_lowercase();
+        let log_index = hex_to_u64(&log.log_index);
+
+        if let Some(created) = inv.created_block {
+            if block_number < created {
+                return Ok(());
+            }
+        }
+
+        if ev.amount_received == 0 {
+            return Ok(());
+        }
+        let amount = wei_to_decimal(ev.amount_received)?;
+        if ev.amount_received != ev.amount_requested {
+            println!(
+                "[{}] note: fee-on-transfer delta on invoice {}: requested {} received {}",
+                self.network_name, inv.invoice_id, ev.amount_requested, ev.amount_received
+            );
+        }
+
+        let (event_index, event_ref) = Self::event_index_log(log_index);
+
+        let mut extra = Map::new();
+        extra.insert("TokenAddress".into(), json!(ev.token_lc));
+        extra.insert("Payer".into(), json!(ev.payer_lc));
+        extra.insert("AmountRequested".into(), json!(ev.amount_requested.to_string()));
+
+
+        let credit = Credit {
+            inv,
+            amount,
+            path: PaymentPath::Reference, // identified by invoice id in the log
+            // Native invoices arrive tagged address(0) in the event; the asset
+            // is the chain's native one, not a contract at the sentinel.
+            asset: self.asset_for(inv.token_lc.as_deref()),
+            event_index,
+            event_ref,
+            from_lc: Some(ev.payer_lc.clone()),
+            to_lc: vault_lc.to_string(),
+            to_kind: AddressKind::Vault,
+            extra,
+        };
+
+        // No block body on this path, so no block_time. Recognition falls back
+        // to now() and records occurred_at_exact = false. If that matters for
+        // fee-rate resolution, fetch the block header per distinct block in
+        // tick_logs and pass it through.
+        let touched = self
+            .apply_credits(pool, &tx_hash, block_number, &block_hash, block_time, std::slice::from_ref(&credit))
+            .await?;
+
+        if !touched.is_empty() {
+            self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
+        }
+        Ok(())
+    }
+
 
     // ── Building the plan ──────────────────────────────────────────────────────────
     /// The set of block ranges that can possibly contain money we care about.
@@ -660,95 +1158,6 @@ impl EVMNetwork {
         Ok(())
     }
 
-    async fn apply_erc20_transfers(
-        &self,
-        pool: &PgPool,
-        block: &BlockView,
-        transfers: &[Erc20Transfer],
-        by_address: &HashMap<String, Vec<WatchedInvoice>>,
-    ) -> Result<(), String> {
-        for t in transfers {
-            let Some(invoices) = by_address.get(&t.to_lc) else { continue };
-            let amount = wei_to_decimal(t.amount)?;
-
-            for inv in invoices {
-                // Only credit invoices that expect exactly this token.
-                // None => native invoice, not this path at all.
-                let Some(expected_token) = inv.token_lc.as_deref() else { continue };
-                if expected_token != t.token_lc {
-                    continue;
-                }
-
-                if let Some(created) = inv.created_block {
-                    if (block.number as i64) < created {
-                        continue;
-                    }
-                }
-
-                let mut tx = pool.begin().await
-                    .map_err(|e| format!("apply_erc20_transfers begin tx: {e}"))?;
-
-                let inserted = sqlx::query(
-                    r#"
-        INSERT INTO payments
-            (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
-        VALUES ($1, $2, $3, $4, $5, 0, 'detected')
-        ON CONFLICT (invoice_id, tx_hash) DO NOTHING
-        "#,
-                )
-                    .bind(inv.invoice_id)
-                    .bind(&t.tx_hash)
-                    .bind(amount)
-                    .bind(block.number as i64)
-                    .bind(&block.hash)
-                    .execute(&mut *tx).await
-                    .map_err(|e| format!("insert erc20 payment: {e}"))?
-                    .rows_affected() == 1;
-
-                if inserted {
-                    println!(
-                        "[{}] detected {} of token {} -> {} (invoice {}, tx {}, block {})",
-                        self.network_name, t.amount, t.token_lc, t.to_lc,
-                        inv.invoice_id, t.tx_hash, block.number
-                    );
-
-                    let mut fields = Map::new();
-                    fields.insert("TokenAddress".into(), json!(t.token_lc));
-                    fields.insert("TxHash".into(), json!(t.tx_hash));
-                    fields.insert("AmountBaseUnits".into(), json!(amount.to_string()));
-                    fields.insert("BlockNumber".into(), json!(block.number));
-                    fields.insert("BlockHash".into(), json!(block.hash));
-                    fields.insert("Confirmations".into(), json!(0));
-
-                    enqueue_webhook(&mut tx, inv.invoice_id, "payment.detected", &t.tx_hash, fields).await?;
-                } else {
-                    sqlx::query(
-                        r#"
-            UPDATE payments
-               SET block_number = $2, block_hash = $3,
-                   status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
-                   updated_at = now()
-             WHERE invoice_id = $1 AND tx_hash = $4
-               AND (block_hash <> $3 OR status = 'orphaned')
-            "#,
-                    )
-                        .bind(inv.invoice_id)
-                        .bind(block.number as i64)
-                        .bind(&block.hash)
-                        .bind(&t.tx_hash)
-                        .execute(&mut *tx).await
-                        .map_err(|e| format!("relocate erc20 payment: {e}"))?;
-                }
-
-                tx.commit().await
-                    .map_err(|e| format!("apply_erc20_transfers commit tx: {e}"))?;
-
-                self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
-            }
-        }
-        Ok(())
-    }
-
     // ── Who are we watching ──────────────────────────────────────────────────────────
 
     /// Changed vs the old version: `i.status = 'pending'` became
@@ -770,7 +1179,7 @@ impl EVMNetwork {
     /// 'paid' still needs its confirmation counter driven to FINAL_CONFIRMATIONS,
     /// and that must survive a process restart with an empty `self.pending`.
     async fn load_watched_invoices(&self, pool: &PgPool) -> Result<Vec<WatchedInvoice>, String> {
-        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>, Option<String>)>(
+        let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String, rust_decimal::Decimal, i64, Option<i64>, Option<String>, String)>(
             r#"
     SELECT i.id,
            i.merchant_id,
@@ -779,7 +1188,8 @@ impl EVMNetwork {
            i.amount_requested,
            COALESCE(i.required_confirmations, $3)::bigint,
            i.created_block,
-           lower(i.token_address)
+           lower(i.token_address),
+           i.token_id
       FROM invoices i
       JOIN merchant_wallets mw
         ON mw.merchant_id  = i.merchant_id
@@ -803,7 +1213,8 @@ impl EVMNetwork {
 
         Ok(rows
             .into_iter()
-            .map(|(invoice_id, merchant_id, address_lc, merchant_wallet_lc, amount_requested, required_confirmations, created_block, token_lc)| {
+            .map(|(invoice_id, merchant_id, address_lc, merchant_wallet_lc, amount_requested,
+                      required_confirmations, created_block, token_lc, token_id)| {
                 WatchedInvoice {
                     invoice_id,
                     merchant_id,
@@ -813,6 +1224,7 @@ impl EVMNetwork {
                     required_confirmations,
                     created_block,
                     token_lc,
+                    token_id,
                 }
             })
             .collect())
@@ -838,7 +1250,14 @@ impl EVMNetwork {
             return Ok(out);
         }
 
-        for addr_chunk in to_addresses.chunks(MAX_TOPIC_ADDRESSES) {
+        // Two invoices can share a deposit address. Chunking a list with
+        // duplicates in it puts the same address in two filters and returns the
+        // same log twice, which is a duplicate (tx_id, event_index) movement.
+        let mut uniq: Vec<String> = to_addresses.to_vec();
+        uniq.sort();
+        uniq.dedup();
+
+        for addr_chunk in uniq.chunks(MAX_TOPIC_ADDRESSES) {
             let to_topics: Vec<String> = addr_chunk.iter().map(|a| address_to_topic(a)).collect();
 
             let filter = serde_json::json!({
@@ -855,6 +1274,10 @@ impl EVMNetwork {
                 if log.topics.len() != 3 {
                     continue;
                 }
+                let from_lc = match topic_to_address(&log.topics[1]) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
                 let to_lc = match topic_to_address(&log.topics[2]) {
                     Ok(a) => a,
                     Err(_) => continue,
@@ -875,7 +1298,9 @@ impl EVMNetwork {
                     .or_default()
                     .push(Erc20Transfer {
                         tx_hash: log.transaction_hash.to_lowercase(),
+                        log_index: hex_to_u64(&log.log_index),
                         token_lc: log.address.to_lowercase(),
+                        from_lc,
                         to_lc,
                         amount,
                         block_hash: log.block_hash.to_lowercase(),
@@ -1135,217 +1560,10 @@ impl EVMNetwork {
         Ok(Some(floor))
     }
 
-    /// Everything strictly above `fork_point` is no longer trustworthy.
-    ///
-    /// Rule (per spec): a webhook only goes out if the payment's block genuinely
-    /// got orphaned and the tx is gone. If the tx merely got re-mined into a
-    /// different block, we silently reset its state (confirmations back to 0,
-    /// status back to 'detected') and let the normal flow re-confirm it.
-    async fn handle_reorg(
-        &self,
-        pool: &PgPool,
-        fork_point: i64,
-        watched: &[WatchedInvoice],
-    ) -> Result<(), String> {
-        let ids: Vec<Uuid> = watched.iter().map(|w| w.invoice_id).collect();
-        if ids.is_empty() {
-            return Ok(());
-        }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Confirmations / recognition
+    // ─────────────────────────────────────────────────────────────────────────
 
-        let affected = sqlx::query_as::<_, (Uuid, Uuid, String, i64, String, String)>(
-            r#"
-            SELECT p.id, p.invoice_id, p.tx_hash, p.block_number, p.block_hash, p.status
-              FROM payments p
-             WHERE p.invoice_id = ANY($1)
-               AND p.block_number > $2
-               AND p.status <> 'orphaned'
-            "#,
-        )
-            .bind(&ids)
-            .bind(fork_point)
-            .fetch_all(pool).await
-            .map_err(|e| format!("handle_reorg select: {e}"))?;
-
-        for (payment_id, invoice_id, tx_hash, old_block, old_hash, old_status) in affected {
-            match self.locate_tx(&tx_hash).await? {
-                // Still mined, and in a block we now consider canonical.
-                Some((Some(new_block), Some(new_hash))) => {
-                    if new_hash == old_hash && new_block == old_block as u64 {
-                        // Same block survived the reorg (it was above the fork
-                        // point but on the winning branch after all). Still reset
-                        // the counter — refresh_confirmations will recompute it
-                        // from the tip on this very tick, so nothing is lost.
-                    }
-                    sqlx::query(
-                        r#"
-                        UPDATE payments
-                           SET block_number = $2,
-                               block_hash   = $3,
-                               confirmations = 0,
-                               status = 'detected',
-                               updated_at = now()
-                         WHERE id = $1
-                        "#,
-                    )
-                        .bind(payment_id).bind(new_block as i64).bind(&new_hash)
-                        .execute(pool).await
-                        .map_err(|e| format!("handle_reorg re-mine update: {e}"))?;
-
-                    println!(
-                        "[{}] payment {} re-mined {}@{} -> {}@{}, confirmations reset (no webhook)",
-                        self.network_name, payment_id, old_block, old_hash, new_block, new_hash
-                    );
-                    // No webhook: the money never went away, it just moved
-                    // blocks. Merchant-visible state (amount_received) is
-                    // unchanged, only the confirmation countdown restarts.
-                    // If it had already been reported as merchant_confirmed we
-                    // will re-emit payment.confirmed once it re-crosses the
-                    // threshold — see refresh_confirmations.
-                }
-
-                // Known to the node but back in the mempool, or dropped entirely.
-                // Mempool, missing hash/number, or completely dropped
-                Some((Some(_), None)) | Some((None, _)) | None => {
-                    let mut tx = pool.begin().await
-                        .map_err(|e| format!("handle_reorg begin tx: {e}"))?;
-
-                    sqlx::query(
-                        r#"
-        UPDATE payments
-           SET status = 'orphaned', confirmations = 0, updated_at = now()
-         WHERE id = $1
-        "#,
-                    )
-                        .bind(payment_id)
-                        .execute(&mut *tx).await
-                        .map_err(|e| format!("handle_reorg orphan update: {e}"))?;
-
-                    println!(
-                        "[{}] payment {} orphaned (tx {} no longer mined, was {}@{}, prev status {})",
-                        self.network_name, payment_id, tx_hash, old_block, old_hash, old_status
-                    );
-
-                    let mut fields = Map::new();
-                    fields.insert("PaymentId".into(), json!(payment_id));
-                    fields.insert("TxHash".into(), json!(tx_hash));
-                    fields.insert("OldBlockNumber".into(), json!(old_block));
-                    fields.insert("OldBlockHash".into(), json!(old_hash));
-                    fields.insert("PreviousStatus".into(), json!(old_status));
-
-                    // This is the *only* reorg case that notifies the merchant:
-                    // the funds they were told about are gone, so anything they
-                    // shipped on the back of payment.detected/confirmed needs to
-                    // be walked back on their side.
-
-                    // TODO: skip this call entirely once merchant webhook settings exist and this merchant has opted out of orphaned notifications.
-                    enqueue_webhook(&mut tx, invoice_id, "payment.orphaned", &payment_id.to_string(), fields).await?;
-
-                    tx.commit().await
-                        .map_err(|e| format!("handle_reorg commit tx: {e}"))?;
-                }
-            }
-
-            // amount_received / invoice status must be rebuilt from the
-            // surviving payments, not decremented, so it stays correct no matter
-            // how many times a reorg replays.
-            self.recompute_invoice_totals(pool, invoice_id, watched).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Credit every native transfer in this block that lands on a watched address.
-    async fn apply_block(
-        &self,
-        pool: &PgPool,
-        block: &BlockView,
-        by_address: &HashMap<String, Vec<WatchedInvoice>>,
-    ) -> Result<(), String> {
-        for (tx_hash, to_lc, value) in &block.transfers {
-            let Some(invoices) = by_address.get(to_lc) else { continue };
-            let amount = wei_to_decimal(*value)?;
-
-            for inv in invoices {
-                // This path is native-value only — a token invoice at this
-                // address must never be credited from a plain ETH transfer.
-                if inv.token_lc.is_some() {
-                    continue;
-                }
-
-                if let Some(created) = inv.created_block {
-                    if (block.number as i64) < created {
-                        continue;
-                    }
-                }
-
-                let mut tx = pool.begin().await
-                    .map_err(|e| format!("apply_block begin tx: {e}"))?;
-
-                let inserted = sqlx::query(
-                    r#"
-        INSERT INTO payments
-            (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
-        VALUES ($1, $2, $3, $4, $5, 0, 'detected')
-        ON CONFLICT (invoice_id, tx_hash) DO NOTHING
-        "#,
-                )
-                    .bind(inv.invoice_id)
-                    .bind(tx_hash)
-                    .bind(amount)
-                    .bind(block.number as i64)
-                    .bind(&block.hash)
-                    .execute(&mut *tx).await
-                    .map_err(|e| format!("insert payment: {e}"))?
-                    .rows_affected() == 1;
-
-                if inserted {
-                    println!(
-                        "[{}] detected {} wei -> {} (invoice {}, tx {}, block {})",
-                        self.network_name, value, to_lc, inv.invoice_id, tx_hash, block.number
-                    );
-
-                    let mut fields = Map::new();
-                    fields.insert("TxHash".into(), json!(tx_hash));
-                    fields.insert("AmountBaseUnits".into(), json!(amount.to_string()));
-                    fields.insert("BlockNumber".into(), json!(block.number));
-                    fields.insert("BlockHash".into(), json!(block.hash));
-                    fields.insert("Confirmations".into(), json!(0));
-
-                    // First time we've ever seen this tx for this invoice.
-                    enqueue_webhook(&mut tx, inv.invoice_id, "payment.detected", tx_hash, fields).await?;
-                } else {
-                    sqlx::query(
-                        r#"
-            UPDATE payments
-               SET block_number = $2, block_hash = $3,
-                   status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
-                   updated_at = now()
-             WHERE invoice_id = $1 AND tx_hash = $4
-               AND (block_hash <> $3 OR status = 'orphaned')
-            "#,
-                    )
-                        .bind(inv.invoice_id)
-                        .bind(block.number as i64)
-                        .bind(&block.hash)
-                        .bind(tx_hash)
-                        .execute(&mut *tx).await
-                        .map_err(|e| format!("relocate payment: {e}"))?;
-                }
-
-                tx.commit().await
-                    .map_err(|e| format!("apply_block commit tx: {e}"))?;
-
-                self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Recount confirmations from the tip for everything still in flight, then
-    /// promote across the two thresholds.
-    ///
-    /// confirmations = tip - block_number + 1, i.e. the including block itself
-    /// counts as 1. A payment in the tip block has 1 confirmation.
     async fn refresh_confirmations(
         &self,
         pool: &PgPool,
@@ -1356,9 +1574,8 @@ impl EVMNetwork {
             return Ok(());
         }
         let ids: Vec<Uuid> = watched.iter().map(|w| w.invoice_id).collect();
-        let thresholds: HashMap<Uuid, (Uuid, i64)> = watched.iter()
-            .map(|w| (w.invoice_id, (w.merchant_id, w.required_confirmations)))
-            .collect();
+        let thresholds: HashMap<Uuid, i64> =
+            watched.iter().map(|w| (w.invoice_id, w.required_confirmations)).collect();
 
         sqlx::query(
             r#"
@@ -1374,6 +1591,8 @@ impl EVMNetwork {
             .execute(pool).await
             .map_err(|e| format!("refresh_confirmations: {e}"))?;
 
+        // `system_confirmed` is recognized and no longer polled; a deep reorg
+        // that reaches back past it is handle_reorg's business, not this loop's.
         let rows = sqlx::query_as::<_, (Uuid, Uuid, String, i64, String, i64, String)>(
             r#"
             SELECT p.id, p.invoice_id, p.tx_hash, p.block_number, p.block_hash,
@@ -1388,11 +1607,15 @@ impl EVMNetwork {
             .fetch_all(pool).await
             .map_err(|e| format!("refresh_confirmations select: {e}"))?;
 
-        for (payment_id, invoice_id, tx_hash, block_number, _block_hash, confirmations, status) in rows {
-            let Some((merchant_id, required)) = thresholds.get(&invoice_id).copied() else { continue };
+        for (payment_id, invoice_id, tx_hash, block_number, block_hash, confirmations, status) in rows {
+            let Some(required) = thresholds.get(&invoice_id).copied() else { continue };
 
             // ── merchant threshold ───────────────────────────────────────────
             if status == "detected" && confirmations >= required {
+                let mut tx = pool.begin().await
+                    .map_err(|e| format!("refresh_confirmations begin tx (confirmed): {e}"))?;
+
+                // The guarded UPDATE is the once-only latch.
                 let promoted = sqlx::query(
                     r#"
                     UPDATE payments
@@ -1401,7 +1624,7 @@ impl EVMNetwork {
                     "#,
                 )
                     .bind(payment_id)
-                    .execute(pool).await
+                    .execute(&mut *tx).await
                     .map_err(|e| format!("promote merchant_confirmed: {e}"))?
                     .rows_affected() == 1;
 
@@ -1411,70 +1634,216 @@ impl EVMNetwork {
                         self.network_name, payment_id, confirmations, required
                     );
 
-                    // ── WEBHOOK ───────────────────────────────────────────────
-                    // Notify the merchant that this payment crossed their
-                    // required confirmation threshold and is now confirmed.
-                    let mut tx = pool.begin().await
-                        .map_err(|e| format!("refresh_confirmations begin tx (confirmed): {e}"))?;
+                    // Chain layer only. No journal at this level (§5.3).
+                    self.ledger
+                        .mark_confirmed(&mut *tx, &self.chain(), &tx_hash)
+                        .await
+                        .map_err(|e| e.to_string())?;
 
                     let mut fields = Map::new();
                     fields.insert("PaymentId".into(), json!(payment_id));
                     fields.insert("TxHash".into(), json!(tx_hash));
                     fields.insert("BlockNumber".into(), json!(block_number));
+                    fields.insert("BlockHash".into(), json!(block_hash));
                     fields.insert("Confirmations".into(), json!(confirmations));
                     fields.insert("RequiredConfirmations".into(), json!(required));
 
-                    // The guarded UPDATE above (status = 'detected' in the WHERE)
-                    // is the once-only latch, so two workers racing can't both
-                    // emit this.
-                    enqueue_webhook(&mut tx, invoice_id, "payment.confirmed", &payment_id.to_string(), fields).await?;
+                    let dedupe_key = format!("payment.confirmed:{payment_id}");
+                    enqueue_webhook(&mut tx, invoice_id, "payment.confirmed", &dedupe_key, fields).await?;
 
                     tx.commit().await
                         .map_err(|e| format!("refresh_confirmations commit tx (confirmed): {e}"))?;
-                    // ──────────────────────────────────────────────────────────
+                } else {
+                    tx.rollback().await.ok();
                 }
             }
 
             // ── final / system threshold ─────────────────────────────────────
-            // TODO: FINAL_CONFIRMATIONS is a global constant today; it should be per-chain (48 blocks on Ethereum ≈ 10 min, on Polygon it's ~2 min and you probably want a lot more).
+            // TODO: FINAL_CONFIRMATIONS is global; should be per-chain.
             if confirmations >= FINAL_CONFIRMATIONS {
+                let mut tx = pool.begin().await
+                    .map_err(|e| format!("refresh_confirmations begin tx (finalized): {e}"))?;
+
+                // §5.4: the guarded UPDATE and the journal are one transaction.
+                // `status <> 'orphaned'`: a row handle_reorg orphaned in this
+                // same tick must not be resurrected by a stale confirmations read.
                 let finalized = sqlx::query(
                     r#"
                     UPDATE payments
                        SET status = 'system_confirmed', updated_at = now()
-                     WHERE id = $1 AND status <> 'system_confirmed'
+                     WHERE id = $1
+                       AND status NOT IN ('system_confirmed', 'orphaned')
                     "#,
                 )
                     .bind(payment_id)
-                    .execute(pool).await
+                    .execute(&mut *tx).await
                     .map_err(|e| format!("promote system_confirmed: {e}"))?
                     .rows_affected() == 1;
 
-                if finalized {
-                    println!(
-                        "[{}] payment {} reached {} confirmations -> system_confirmed (block {}), no longer polled",
-                        self.network_name, payment_id, confirmations, block_number
-                    );
-
-                    // ── WEBHOOK (optional) ────────────────────────────────────
-                    // Lets merchants who hold shipment until settlement is
-                    // final know this payment is now irreversible.
-                    let mut tx = pool.begin().await
-                        .map_err(|e| format!("refresh_confirmations begin tx (finalized): {e}"))?;
-
-                    let mut fields = Map::new();
-                    fields.insert("PaymentId".into(), json!(payment_id));
-                    fields.insert("TxHash".into(), json!(tx_hash));
-                    fields.insert("BlockNumber".into(), json!(block_number));
-                    fields.insert("Confirmations".into(), json!(confirmations));
-
-                    enqueue_webhook(&mut tx, invoice_id, "payment.finalized", &payment_id.to_string(), fields).await?;
-
-                    tx.commit().await
-                        .map_err(|e| format!("refresh_confirmations commit tx (finalized): {e}"))?;
-                    // ──────────────────────────────────────────────────────────
-
+                if !finalized {
+                    tx.rollback().await.ok();
+                    continue;
                 }
+
+                println!(
+                    "[{}] payment {} reached {} confirmations -> system_confirmed (block {}), no longer polled",
+                    self.network_name, payment_id, confirmations, block_number
+                );
+
+                // Everything recognition needs, read inside the same tx. The
+                // asset comes off the payment's own movement — the thing the
+                // Ledgerer will book — not re-derived from the invoice.
+                let ctx = sqlx::query(
+                    r#"
+                    SELECT i.merchant_id, i.token_id, lower(i.wallet_address) AS wallet_address,
+                           i.wallet_index, p.payment_path,
+                           m.token_address, m.asset_params, m.to_kind
+                      FROM payments p
+                      JOIN invoices i ON i.id = p.invoice_id
+                      LEFT JOIN LATERAL (
+                          SELECT NULLIF(a.address, '') AS token_address, a.asset_params, cm.to_kind
+                            FROM chain_movements cm
+                            JOIN assets a ON a.id = cm.asset_id
+                           WHERE cm.payment_id = p.id
+                           ORDER BY cm.event_index
+                           LIMIT 1
+                      ) m ON true
+                     WHERE p.id = $1
+                    "#,
+                )
+                    .bind(payment_id)
+                    .fetch_one(&mut *tx).await
+                    .map_err(|e| format!("recognition ctx: {e}"))?;
+
+                let merchant_id: Uuid = ctx.get("merchant_id");
+                let token_id: String = ctx.get("token_id");
+                let wallet_address: String = ctx.get("wallet_address");
+                let wallet_index: Option<i32> = ctx.get("wallet_index");
+                let path_str: Option<String> = ctx.get("payment_path");
+                let token_address: Option<String> = ctx.get("token_address");
+
+                // A NULL path means the row predates the ledger. It also has no
+                // movements, so recognition would fail anyway — fail here with a
+                // message that says what to do.
+                let path = path_str
+                    .as_deref()
+                    .and_then(PaymentPath::from_db)
+                    .ok_or_else(|| format!(
+                        "payment {payment_id}: payment_path is {path_str:?}; pre-ledger row, \
+                         backfill payment_path + chain_movements or let it drain before deploy"
+                    ))?;
+
+                // §2.8: on EVM the deposit EOA signs for itself. An ERC-20 sweep
+                // needs the EOA to hold gas first, which is the gas wallet's job.
+                let to_kind: Option<String> = ctx.get("to_kind");
+
+                // Custody is decided by where the value landed, not by path.
+                let custody = match to_kind.as_deref() {
+                    // §2.8: the deposit EOA signs for itself. An ERC-20 sweep
+                    // needs the EOA to hold gas first, which is the gas wallet's job.
+                    Some("deposit_address") => Some(Custody {
+                        address: wallet_address.clone(),
+                        kind: AddressKind::DepositAddress,
+                        authority_address: wallet_address.clone(),
+                        authority_ref: wallet_index.map(|i| i.to_string()),
+                        sweep_params: json!({
+                            "chain_id": self.chain_id,
+                            "mechanism": "eoa_transfer",
+                            "token": token_address,               // null => native
+                            "gas_topup_required": token_address.is_some(),
+                            "external_fee_payer": false,
+                        }),
+                    }),
+
+                    // Vault: value sits in the contract under
+                    // _vault[token][merchant]. Only the merchant wallet can
+                    // pull it (sweep() pays msg.sender), so the authority is
+                    // the index-0 merchant wallet, and it always needs gas —
+                    // even for native, since the ETH is inside the contract.
+                    // sweep(token) drains the whole (token, merchant) balance,
+                    // so the sweeper must claim and settle every pending row
+                    // for that pair with one call, not one tx per row.
+                    Some("vault") => {
+                        let vault = self
+                            .contract_address
+                            .as_deref()
+                            .map(str::to_lowercase)
+                            .ok_or_else(|| format!(
+                                "payment {payment_id}: vault movement but no contract_address configured"
+                            ))?;
+                        let merchant_wallet = watched
+                            .iter()
+                            .find(|w| w.invoice_id == invoice_id)
+                            .map(|w| w.merchant_wallet_lc.clone())
+                            .ok_or_else(|| format!(
+                                "payment {payment_id}: vault movement but invoice not in watched set"
+                            ))?;
+                        Some(Custody {
+                            address: vault.clone(),
+                            kind: AddressKind::Vault,
+                            authority_address: merchant_wallet,
+                            authority_ref: Some(0.to_string()),
+                            sweep_params: json!({
+                                "chain_id": self.chain_id,
+                                "mechanism": "vault_sweep",
+                                "vault": vault,
+                                "token": token_address,           // null => sweep(address(0))
+                                "aggregate_by": ["custody_address", "authority_address", "asset_id"],
+                                "gas_topup_required": true,
+                                "external_fee_payer": false,
+                            }),
+                        })
+                    }
+
+                    // Landed in the merchant's own wallet: nothing to sweep.
+                    Some("merchant_main") => None,
+
+                    other => return Err(format!(
+                        "payment {payment_id}: cannot build custody for to_kind {other:?}"
+                    )),
+                };
+
+
+                let outcome = self
+                    .ledger
+                    .recognize_payment(
+                        &mut *tx,
+                        &RecognizeInput {
+                            chain: self.chain(),
+                            tx_hash: tx_hash.clone(),
+                            payment_id,
+                            invoice_id,
+                            merchant_id,
+                            token_id,
+                            path,
+                            block_time: None, // stamped on chain_txs at detection
+                            custody,
+                            already_swept: false, // until payments.swept_by_tx_id exists
+                        },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                if let Some(j) = outcome.journal_id {
+                    println!(
+                        "[{}] payment {} recognized: journal {} amount {} fee {} ({} bps), {} sweep row(s)",
+                        self.network_name, payment_id, j, outcome.amount, outcome.fee,
+                        outcome.fee_bps, outcome.sweep_rows_enqueued
+                    );
+                }
+
+                let mut fields = Map::new();
+                fields.insert("PaymentId".into(), json!(payment_id));
+                fields.insert("TxHash".into(), json!(tx_hash));
+                fields.insert("BlockNumber".into(), json!(block_number));
+                fields.insert("BlockHash".into(), json!(block_hash));
+                fields.insert("Confirmations".into(), json!(confirmations));
+
+                let dedupe_key = format!("payment.finalized:{payment_id}");
+                enqueue_webhook(&mut tx, invoice_id, "payment.finalized", &dedupe_key, fields).await?;
+
+                tx.commit().await
+                    .map_err(|e| format!("refresh_confirmations commit tx (finalized): {e}"))?;
             }
 
             self.recompute_invoice_totals(pool, invoice_id, watched).await?;
@@ -1509,6 +1878,235 @@ impl EVMNetwork {
 
         Ok(())
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Reorg
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Everything above `fork_point` is suspect. Re-located txs keep their
+    /// value and restart the confirmation countdown; dropped txs are orphaned
+    /// and, if already recognized, reversed in the ledger.
+    ///
+    /// A SweepInFlight alarm on one payment does not stop the others being
+    /// handled — but it does fail the tick, so the cursor stays put and the
+    /// fork is re-detected next tick. That is a retry loop on purpose: a sweep
+    /// in flight against vanished value is not something to step past quietly.
+    async fn handle_reorg(
+        &self,
+        pool: &PgPool,
+        fork_point: i64,
+        watched: &[WatchedInvoice],
+    ) -> Result<(), String> {
+        let ids: Vec<Uuid> = watched.iter().map(|w| w.invoice_id).collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        // Includes system_confirmed: a reorg deeper than FINAL_CONFIRMATIONS is
+        // exactly the probabilistic case the reversal path exists for.
+        let affected = sqlx::query_as::<_, (Uuid, Uuid, String, i64, String, String)>(
+            r#"
+            SELECT p.id, p.invoice_id, p.tx_hash, p.block_number, p.block_hash, p.status
+              FROM payments p
+             WHERE p.invoice_id = ANY($1)
+               AND p.block_number > $2
+               AND p.status <> 'orphaned'
+            "#,
+        )
+            .bind(&ids)
+            .bind(fork_point)
+            .fetch_all(pool).await
+            .map_err(|e| format!("handle_reorg select: {e}"))?;
+
+        let mut first_err: Option<String> = None;
+
+        for (payment_id, invoice_id, tx_hash, old_block, old_hash, old_status) in affected {
+            match self.locate_tx(&tx_hash).await? {
+                // Still mined, in a block we now consider canonical.
+                Some((Some(new_block), Some(new_hash))) => {
+                    let mut tx = pool.begin().await
+                        .map_err(|e| format!("handle_reorg begin tx (re-mine): {e}"))?;
+
+                    sqlx::query(
+                        r#"
+                        UPDATE payments
+                           SET block_number = $2,
+                               block_hash   = $3,
+                               confirmations = 0,
+                               status = 'detected',
+                               updated_at = now()
+                         WHERE id = $1
+                        "#,
+                    )
+                        .bind(payment_id).bind(new_block as i64).bind(&new_hash)
+                        .execute(&mut *tx).await
+                        .map_err(|e| format!("handle_reorg re-mine update: {e}"))?;
+
+                    // Chain layer follows. record_detected with no transfers is
+                    // the sanctioned relocate: it refreshes block fields on
+                    // chain_transactions and never regresses confirmed/final.
+                    // If a journal already exists (was system_confirmed), the
+                    // latch in recognize_payment makes the re-climb a no-op —
+                    // the money never left, so the books don't move.
+                    self.ledger
+                        .record_detected(
+                            &mut *tx,
+                            &ObservedInbound {
+                                chain: self.chain(),
+                                tx_hash: tx_hash.clone(),
+                                block_number: Some(new_block as i64),
+                                block_hash: Some(new_hash.clone()),
+                                block_time: None,
+                                merchant_id: None,
+                                token_id: None,
+                                transfers: Vec::new(),
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    tx.commit().await
+                        .map_err(|e| format!("handle_reorg commit tx (re-mine): {e}"))?;
+
+                    println!(
+                        "[{}] payment {} re-mined {}@{} -> {}@{}, confirmations reset (no webhook)",
+                        self.network_name, payment_id, old_block, old_hash, new_block, new_hash
+                    );
+                }
+
+                // Back in the mempool, or dropped entirely.
+                Some((Some(_), None)) | Some((None, _)) | None => {
+                    match self
+                        .orphan_payment(pool, payment_id, invoice_id, &tx_hash, old_block, &old_hash, &old_status)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("[{}] handle_reorg: {e}", self.network_name);
+                            first_err.get_or_insert(e);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Rebuilt from surviving payments, never decremented, so this stays
+            // correct no matter how many times a reorg replays.
+            self.recompute_invoice_totals(pool, invoice_id, watched).await?;
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The one reorg case that always notifies the merchant: money we told
+    /// them about is gone.
+    ///
+    /// Same DB transaction for the payments flip, the chain-layer flip, the
+    /// reversal journal (if one is due) and the webhook. On a sweep-in-flight
+    /// alarm everything rolls back and the payments row stays where it was
+    /// for a human to look at.
+    #[allow(clippy::too_many_arguments)]
+    async fn orphan_payment(
+        &self,
+        pool: &PgPool,
+        payment_id: Uuid,
+        invoice_id: Uuid,
+        tx_hash: &str,
+        old_block: i64,
+        old_hash: &str,
+        old_status: &str,
+    ) -> Result<bool, String> {
+        let mut tx = pool.begin().await
+            .map_err(|e| format!("orphan_payment begin tx: {e}"))?;
+
+        let orphaned = sqlx::query(
+            r#"
+            UPDATE payments
+               SET status = 'orphaned', confirmations = 0, updated_at = now()
+             WHERE id = $1 AND status <> 'orphaned'
+            "#,
+        )
+            .bind(payment_id)
+            .execute(&mut *tx).await
+            .map_err(|e| format!("orphan update: {e}"))?
+            .rows_affected() == 1;
+
+        if !orphaned {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+
+        println!(
+            "[{}] payment {} orphaned (tx {} no longer mined, was {}@{}, prev status {})",
+            self.network_name, payment_id, tx_hash, old_block, old_hash, old_status
+        );
+
+        // §5.1: N confirmations is a probability, so a recognized journal here
+        // is a legitimate case and gets a reversal. SweepInFlight is the one
+        // thing that refuses: value vanished under a sweep that's already
+        // claimed or broadcast.
+        let outcome = self
+            .ledger
+            .orphan(
+                &mut *tx,
+                &OrphanInput {
+                    chain: self.chain(),
+                    tx_hash: tx_hash.to_string(),
+                    payment_id,
+                    finality: Finality::Probabilistic,
+                    reason: format!("reorg: tx no longer mined, was {old_block}@{old_hash}"),
+                },
+            )
+            .await;
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                if matches!(e, LedgerError::SweepInFlight { .. } | LedgerError::ImpossibleReversal { .. }) {
+                    eprintln!("[{}] REFUSING to orphan payment {payment_id}: {e}", self.network_name);
+                }
+                tx.rollback().await.ok();
+                return Err(e.to_string());
+            }
+        };
+
+        let reversed = match &outcome {
+            crate::ledgerer::OrphanOutcome::Reversed { reversal_journal_id, .. } => {
+                println!(
+                    "[{}] payment {} was recognized; reversal journal {} written",
+                    self.network_name, payment_id, reversal_journal_id
+                );
+                Some(*reversal_journal_id)
+            }
+            _ => None,
+        };
+
+        let mut fields = Map::new();
+        fields.insert("PaymentId".into(), json!(payment_id));
+        fields.insert("TxHash".into(), json!(tx_hash));
+        fields.insert("OldBlockNumber".into(), json!(old_block));
+        fields.insert("OldBlockHash".into(), json!(old_hash));
+        fields.insert("PreviousStatus".into(), json!(old_status));
+        fields.insert("LedgerReversed".into(), json!(reversed.is_some()));
+
+        // Block in the key: a payment can be orphaned, re-land, and be
+        // orphaned again; on the bare payment_id the second event would be
+        // deduped away.
+        let dedupe_key = format!("payment.orphaned:{payment_id}:{old_block}");
+
+        // TODO: skip once merchant webhook settings exist and this merchant
+        //       has opted out of orphaned notifications.
+        enqueue_webhook(&mut tx, invoice_id, "payment.orphaned", &dedupe_key, fields).await?;
+
+        tx.commit().await
+            .map_err(|e| format!("orphan_payment commit tx: {e}"))?;
+
+        Ok(true)
+    }
+
 
     /// Rebuild invoices.amount_received / status from the non-orphaned payments.
     /// Always a full recompute (never a delta) so reorgs, rescans and duplicate
@@ -1584,7 +2182,7 @@ impl EVMNetwork {
                 fields.insert("AmountRequested".into(), json!(inv.amount_requested));
                 fields.insert("Overpaid".into(), json!(new_status == "overpaid"));
 
-                let dedupe_key = format!("{}:{}", invoice_id, new_status);
+                let dedupe_key = format!("payment.finished:{}:{}", invoice_id, new_status);
                 enqueue_webhook(&mut tx, invoice_id, "payment.finished", &dedupe_key, fields).await?;
 
                 tx.commit().await
@@ -1858,152 +2456,6 @@ impl EVMNetwork {
         Ok(Some(floor))
     }
 
-    /// Apply one decoded-able Payment log. Idempotent for the same reasons as
-    /// apply_block: unique index on (invoice_id, tx_hash) makes rescans and
-    /// crash-replays no-ops.
-    async fn apply_payment_log(
-        &self,
-        pool: &PgPool,
-        log: &Log,
-        by_id: &HashMap<Uuid, WatchedInvoice>,
-    ) -> Result<(), String> {
-        if log.removed {
-            return Ok(()); // reorg-removed entry from a lagging provider; reorg path owns this
-        }
-
-        let ev = match decode_payment_log(log) {
-            Ok(ev) => ev,
-            Err(e) => {
-                // Someone else's event that happens to share topic0, or a
-                // malformed identifier. Not our invoice, not our problem.
-                eprintln!("[{}] skipping undecodable Payment log {}: {e}", self.network_name, log.transaction_hash);
-                return Ok(());
-            }
-        };
-
-        let Some(inv) = by_id.get(&ev.invoice_id) else {
-            return Ok(()); // not an invoice we're watching (settled, expired, other env)
-        };
-
-        // Defense in depth: verify the money is credited to the right merchant wallet.
-        if inv.merchant_wallet_lc != ev.merchant_lc {
-            eprintln!(
-                "[{}] Payment log for invoice {} credits wrong merchant {} (expected {}), ignoring",
-                self.network_name, ev.invoice_id, ev.merchant_lc, inv.merchant_wallet_lc
-            );
-            return Ok(());
-        }
-
-        // Defense in depth: verify the token paid matches what the invoice expects.
-        // token_lc == None means a native-currency invoice, whose only valid token
-        // on the vault is the NATIVE sentinel (address(0)) — same value payNative() emits.
-        let expected_token: &str = inv.token_lc.as_deref().unwrap_or(NATIVE_TOKEN_SENTINEL);
-        if expected_token != ev.token_lc {
-            eprintln!(
-                "[{}] Payment log for invoice {} paid in wrong token {} (expected {}), ignoring",
-                self.network_name, ev.invoice_id, ev.token_lc, expected_token
-            );
-            return Ok(());
-        }
-
-        let block_number = hex_to_u64(&log.block_number) as i64;
-        let block_hash = log.block_hash.to_lowercase();
-        let tx_hash = log.transaction_hash.to_lowercase();
-
-        if let Some(created) = inv.created_block {
-            if block_number < created {
-                return Ok(()); // predates the invoice, not our money
-            }
-        }
-
-        // Credit amountReceived, not amountRequested — matches the vault's own
-        // fee-on-transfer-safe accounting. recompute_invoice_totals will land
-        // the invoice on paid/underpaid/overpaid accordingly.
-        let amount = wei_to_decimal(ev.amount_received)?;
-
-        // TODO: (invoice_id, tx_hash) uniqueness collapses two Payment events
-        //     for the SAME invoice inside the SAME tx (e.g. a batching router)
-        //     into one credit. Needs log_index in the unique key to support that.
-        let mut db_tx = pool.begin().await
-            .map_err(|e| format!("apply_payment_log begin tx: {e}"))?;
-
-        let inserted = sqlx::query(
-            r#"
-        INSERT INTO payments
-            (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status)
-        VALUES ($1, $2, $3, $4, $5, 0, 'detected')
-        ON CONFLICT (invoice_id, tx_hash) DO NOTHING
-        "#,
-        )
-            .bind(inv.invoice_id)
-            .bind(&tx_hash)
-            .bind(amount)
-            .bind(block_number)
-            .bind(&block_hash)
-            .execute(&mut *db_tx).await
-            .map_err(|e| format!("insert token payment: {e}"))?
-            .rows_affected() == 1;
-
-        if inserted {
-            println!(
-                "[{}] detected {} base units of {} -> merchant {} from {} (invoice {}, tx {}, block {})",
-                self.network_name, ev.amount_received, ev.token_lc, ev.merchant_lc,
-                ev.payer_lc, inv.invoice_id, tx_hash, block_number
-            );
-            if ev.amount_received != ev.amount_requested {
-                println!(
-                    "[{}] note: fee-on-transfer delta on invoice {}: requested {} received {}",
-                    self.network_name, inv.invoice_id, ev.amount_requested, ev.amount_received
-                );
-            }
-
-            // ── WEBHOOK ───────────────────────────────────────────────────────
-            // First sighting of this tx for this invoice. Same exactly-once
-            // guarantee as the native path: the unique index on payments is the
-            // latch, so insert + webhook now share the one db tx and commit
-            // (or roll back) together.
-            let mut fields = Map::new();
-            fields.insert("TokenAddress".into(), json!(ev.token_lc));
-            fields.insert("TxHash".into(), json!(tx_hash));
-            fields.insert("Payer".into(), json!(ev.payer_lc));
-            fields.insert("AmountReceived".into(), json!(amount));
-            fields.insert("BlockNumber".into(), json!(block_number));
-            fields.insert("BlockHash".into(), json!(block_hash));
-            fields.insert("Confirmations".into(), json!(0));
-
-            enqueue_webhook(&mut db_tx, inv.invoice_id, "payment.detected", &tx_hash, fields).await?;
-            // ──────────────────────────────────────────────────────────────────
-
-            db_tx.commit().await
-                .map_err(|e| format!("apply_payment_log commit tx: {e}"))?;
-        } else {
-            db_tx.rollback().await
-                .map_err(|e| format!("apply_payment_log rollback tx: {e}"))?;
-
-            // Already known — rescan, or re-mined post-reorg. Refresh location,
-            // never the amount.
-            sqlx::query(
-                r#"
-            UPDATE payments
-               SET block_number = $2, block_hash = $3,
-                   status = CASE WHEN status = 'orphaned' THEN 'detected' ELSE status END,
-                   updated_at = now()
-             WHERE invoice_id = $1 AND tx_hash = $4
-               AND (block_hash <> $3 OR status = 'orphaned')
-            "#,
-            )
-                .bind(inv.invoice_id)
-                .bind(block_number)
-                .bind(&block_hash)
-                .bind(&tx_hash)
-                .execute(pool).await
-                .map_err(|e| format!("relocate token payment: {e}"))?;
-        }
-
-        self.recompute_invoice_totals(pool, inv.invoice_id, std::slice::from_ref(inv)).await?;
-        Ok(())
-    }
-
     pub async fn watch_logs(&self, pool: &PgPool) -> Result<(), String> {
         let Some(contract) = self.contract_address.as_deref() else {
             // e.g. POLYGON_MAINNET_CONTRACT_ADDRESS="" — vault not deployed
@@ -2146,8 +2598,23 @@ impl EVMNetwork {
                 None => break, // provider lagging the tip
             };
 
+            // One header per distinct block so recognition gets the real
+            // block_time (occurred_at_exact = true) instead of now().
+            let mut block_times: HashMap<u64, Option<DateTime<Utc>>> = HashMap::new();
             for log in &logs {
-                self.apply_payment_log(pool, log, &by_id).await?;
+                let n = hex_to_u64(&log.block_number);
+                if !block_times.contains_key(&n) {
+                    let t = self.get_block(n, false).await?.and_then(|b| b.block_time());
+                    block_times.insert(n, t);
+                }
+            }
+
+            for log in &logs {
+                let bt = block_times
+                    .get(&hex_to_u64(&log.block_number))
+                    .copied()
+                    .flatten();
+                self.apply_payment_log(pool, log, &by_id, contract_lc, bt).await?;
             }
 
             self.remember_block(pool, SCAN_SCOPE_LOGS, &anchor).await?;

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ledger — Vestro</title>
+  <link rel="stylesheet" href="/src/ledger.css" />
+</head>
+<body class="page">
+
+<main class="shell">
+
+  <!-- Masthead -->
+  <header class="masthead">
+    <p class="eyebrow">Vestro / Ledger</p>
+    <h1 class="display">Ledger</h1>
+    <p class="body">Every balance here is derived from postings, not from chain reads. Custody is what the deposit
+      addresses hold; payable is what you can withdraw once it is swept. The two sides of each asset sum to zero.</p>
+
+    <div class="section--tight rows" id="ident"></div>
+  </header>
+
+  <!-- Scope -->
+  <section class="section--tight scope">
+    <div class="choices" id="scope" role="radiogroup" aria-label="Network scope"></div>
+    <p class="label label--faint" id="as-of">&nbsp;</p>
+  </section>
+
+  <!-- Counts -->
+  <section class="section--tight panel">
+    <div class="rows" id="counts"></div>
+  </section>
+
+  <!-- Positions -->
+  <section class="section panel panel--flush">
+    <div class="panel-head">
+      <span class="label">Positions</span>
+      <span class="status" id="integrity"><span class="dot"></span><span></span></span>
+    </div>
+
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Asset</th>
+            <th>Network</th>
+            <th class="right">Unswept</th>
+            <th class="right">Treasury</th>
+            <th class="right">Gas</th>
+            <th class="right">Owed to you</th>
+            <th class="right">Fees</th>
+            <th class="right">Unexplained</th>
+          </tr>
+        </thead>
+        <tbody id="positions"></tbody>
+      </table>
+    </div>
+
+    <div class="panel-note">
+      <p class="label label--faint">Select an asset for its account legs</p>
+    </div>
+  </section>
+
+  <!-- Live region: postings -->
+  <section class="section live" id="postings-panel">
+    <div class="panel-head">
+      <span class="label label--accent">Postings</span>
+      <span class="status">
+        <span class="dot pulse"></span>
+        <span id="postings-state">Watching</span>
+      </span>
+    </div>
+
+    <div id="postings" aria-live="polite" aria-relevant="additions"></div>
+  </section>
+
+  <!-- Reconciliation -->
+  <section class="section panel panel--flush">
+    <div class="panel-head">
+      <span class="label">Unswept reconciliation</span>
+      <span class="status" id="recon-state"><span class="dot"></span><span></span></span>
+    </div>
+
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Asset</th>
+            <th>Network</th>
+            <th class="right">Ledger</th>
+            <th class="right">Queued</th>
+            <th class="right">Abandoned</th>
+            <th class="right">Drift</th>
+            <th class="right">State</th>
+          </tr>
+        </thead>
+        <tbody id="recon"></tbody>
+      </table>
+    </div>
+
+    <div class="panel-note" id="recon-note"></div>
+  </section>
+
+  <p class="footnote">
+    Custody stays in deposit addresses until a sweep moves it to treasury.
+    <a class="arrow-link" href="/sweeps.html"><span class="t">Sweeping</span><span class="a">&#8594;</span></a>
+  </p>
+
+</main>
+
+<script type="module" src="/src/ledger.ts"></script>
+</body>
+</html>

@@ -13,6 +13,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(__dirname, 'index.html'),
+        ledger: resolve(__dirname, 'ledger.html'),
         new_invoice: resolve(__dirname, 'new-invoice.html'),
         invoices: resolve(__dirname, 'invoices.html'),
         checkoutSol: resolve(__dirname, 'checkout/SOL.html'),

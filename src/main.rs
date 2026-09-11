@@ -10,6 +10,7 @@ use crate::api::invoices::{get_invoice_blockhash_handler, get_invoice_checkout_h
 // Register our modules globally
 mod networks;
 mod tokens;
+mod keys;
 mod api;
 mod orchestrator;
 mod assets;

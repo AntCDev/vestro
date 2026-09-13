@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO network_scan_state (network_type, chain_ref, scope, last_block, last_block_hash)\n            VALUES ($1, $2, $3, $4, $5)\n            ON CONFLICT (network_type, chain_ref, scope)\n            DO UPDATE SET last_block = EXCLUDED.last_block,\n                          last_block_hash = EXCLUDED.last_block_hash,\n                          updated_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "664758a31a847bac7550f826ec65b8208918cef356e1c82898043b702d74191d"
+}

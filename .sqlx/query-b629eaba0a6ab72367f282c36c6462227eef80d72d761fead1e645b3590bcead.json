@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO network_seen_blocks\n                (network_type, chain_ref, scope, block_number, block_hash, parent_hash)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT (network_type, chain_ref, scope, block_number)\n            DO UPDATE SET block_hash = EXCLUDED.block_hash,\n                          parent_hash = EXCLUDED.parent_hash,\n                          seen_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b629eaba0a6ab72367f282c36c6462227eef80d72d761fead1e645b3590bcead"
+}

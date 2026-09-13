@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT m.id\n        FROM merchants m\n        JOIN merchant_key_material km ON m.id = km.merchant_id\n        WHERE km.key_family = 'bip39'\n          AND NOT EXISTS (\n              SELECT 1 FROM merchant_wallets mw\n              WHERE mw.merchant_id = m.id\n                AND mw.network_type = $1\n                AND mw.role = 0\n                AND mw.wallet_index = 0\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "merchants",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cf4252b442eedefc4692aaa452a2bd93954cd9b11720fd45b87007f3d9828108"
+}

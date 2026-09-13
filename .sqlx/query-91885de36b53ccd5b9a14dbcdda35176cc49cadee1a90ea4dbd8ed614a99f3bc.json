@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT coin_type, template FROM derivation_schemes WHERE network_type = $1 AND version = $2 AND active",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "coin_type",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "derivation_schemes",
+            "name": "coin_type"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "template",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "derivation_schemes",
+            "name": "template"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "91885de36b53ccd5b9a14dbcdda35176cc49cadee1a90ea4dbd8ed614a99f3bc"
+}

@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT amount_requested, amount_received, status\n        FROM invoices WHERE id = $1\n        FOR UPDATE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "amount_requested",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "amount_requested"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "amount_received",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "amount_received"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "7f42b8c128957fbc717766e87ab57cbcf129aa32c4f5e80130eb5d72986e29be"
+}

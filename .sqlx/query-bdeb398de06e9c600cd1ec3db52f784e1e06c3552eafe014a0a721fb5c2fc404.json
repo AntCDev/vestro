@@ -1,0 +1,131 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            e.entry_no    AS \"entry_no!\",\n            e.journal_id  AS \"journal_id!\",\n            e.account_id  AS \"account_id!\",\n            a.kind        AS \"account_kind!\",\n            e.asset_id    AS \"asset_id!\",\n            ast.symbol    AS \"symbol?\",\n            ast.decimals  AS \"decimals!\",\n            ast.network_type AS \"network_type!\",\n            ast.chain_ref AS \"chain_ref!\",\n            e.amount::text AS \"amount!\"\n        FROM ledger_entries e\n        JOIN ledger_accounts a ON a.id = e.account_id\n        JOIN assets ast        ON ast.id = e.asset_id\n        WHERE e.journal_id = ANY($1)\n        ORDER BY e.journal_id, e.entry_no\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "entry_no!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "ledger_entries",
+            "name": "entry_no"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "journal_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_entries",
+            "name": "journal_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "account_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_entries",
+            "name": "account_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "account_kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ledger_accounts",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "asset_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_entries",
+            "name": "asset_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "symbol?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "decimals!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "decimals"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "network_type!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "chain_ref!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "chain_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "amount!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "bdeb398de06e9c600cd1ec3db52f784e1e06c3552eafe014a0a721fb5c2fc404"
+}

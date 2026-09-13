@@ -1,0 +1,179 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            account_id       AS \"account_id!\",\n            merchant_id      AS \"merchant_id!\",\n            kind             AS \"kind!\",\n            asset_id         AS \"asset_id!\",\n            network_type     AS \"network_type!\",\n            chain_ref        AS \"chain_ref!\",\n            asset_kind       AS \"asset_kind!\",\n            asset_address    AS \"asset_address?\",\n            symbol           AS \"symbol?\",\n            decimals         AS \"decimals!\",\n            asset_registered AS \"asset_registered!\",\n            balance::text    AS \"balance!\",\n            entry_count      AS \"entry_count!\",\n            last_activity_at AS \"last_activity_at?\"\n        FROM v_ledger_balances\n        WHERE ($1::uuid IS NULL OR merchant_id = $1)\n        ORDER BY network_type, chain_ref, symbol NULLS LAST, kind\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "account_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "account_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "merchant_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "asset_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "asset_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "network_type!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "chain_ref!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "chain_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "asset_kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "asset_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "asset_address?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "asset_address"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "symbol?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "decimals!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "decimals"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "asset_registered!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "asset_registered"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "balance!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 12,
+        "name": "entry_count!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "entry_count"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "last_activity_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "v_ledger_balances",
+            "name": "last_activity_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      true,
+      true
+    ]
+  },
+  "hash": "befccacec0752ce83ebebfb221937a57f537afb6ccf21e3e117bdfed5b515b65"
+}

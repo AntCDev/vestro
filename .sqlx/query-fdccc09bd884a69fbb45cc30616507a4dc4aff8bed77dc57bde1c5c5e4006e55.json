@@ -1,0 +1,168 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            j.id            AS \"id!\",\n            j.kind          AS \"kind!\",\n            j.dedupe_key    AS \"dedupe_key!\",\n            j.merchant_id   AS \"merchant_id!\",\n            j.tx_id         AS \"tx_id?\",\n            j.payment_id    AS \"payment_id?\",\n            j.reverses      AS \"reverses?\",\n            COALESCE(j.metadata, '{}'::jsonb) AS \"metadata!\",\n            j.occurred_at   AS \"occurred_at!\",\n            j.created_at    AS \"created_at!\",\n            t.tx_hash       AS \"tx_hash?\",\n            t.network_type  AS \"network_type?\",\n            t.chain_ref     AS \"chain_ref?\"\n        FROM ledger_journals j\n        LEFT JOIN chain_transactions t ON t.id = j.tx_id\n        WHERE ($1::uuid IS NULL OR j.merchant_id = $1)\n        ORDER BY j.occurred_at DESC, j.created_at DESC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "dedupe_key!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "dedupe_key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "merchant_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "tx_id?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "tx_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "payment_id?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "payment_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "reverses?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "reverses"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "metadata!",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "occurred_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "occurred_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "ledger_journals",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "tx_hash?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "chain_transactions",
+            "name": "tx_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "network_type?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "chain_transactions",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "chain_ref?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "chain_transactions",
+            "name": "chain_ref"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fdccc09bd884a69fbb45cc30616507a4dc4aff8bed77dc57bde1c5c5e4006e55"
+}

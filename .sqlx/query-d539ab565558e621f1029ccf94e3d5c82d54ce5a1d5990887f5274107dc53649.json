@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE invoices i\n            SET status = 'expired', updated_at = CURRENT_TIMESTAMP\n            WHERE i.network_type = $1\n              AND i.chain_ref = $2\n              AND i.status = 'pending'\n              AND i.amount_received = 0\n              AND i.expires_at < now()\n              AND NOT EXISTS (\n                    SELECT 1 FROM payments p\n                    WHERE p.invoice_id = i.id AND p.status <> 'orphaned'\n              )\n            RETURNING i.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d539ab565558e621f1029ccf94e3d5c82d54ce5a1d5990887f5274107dc53649"
+}

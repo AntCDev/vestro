@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address, derivation_path FROM operational_wallets WHERE scope = 'platform' AND network_type = $1 AND role = 1 AND wallet_index = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "operational_wallets",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "derivation_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "operational_wallets",
+            "name": "derivation_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b2a04c17601f3d71d30dbe418a47f6fb4c8bdcf592b1b750a1549af90b5132cc"
+}

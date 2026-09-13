@@ -1,0 +1,179 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            merchant_id        AS \"merchant_id!\",\n            network_type       AS \"network_type!\",\n            chain_ref          AS \"chain_ref!\",\n            asset_id           AS \"asset_id!\",\n            symbol             AS \"symbol?\",\n            decimals           AS \"decimals!\",\n            custody_address    AS \"custody_address!\",\n            custody_kind       AS \"custody_kind!\",\n            authority_address  AS \"authority_address?\",\n            movement_count     AS \"movement_count!\",\n            total_amount::text AS \"total_amount!\",\n            oldest_enqueued_at AS \"oldest_enqueued_at?\",\n            next_available_at  AS \"next_available_at?\",\n            max_attempts       AS \"max_attempts!\"\n        FROM v_sweep_backlog\n        WHERE ($1::uuid IS NULL OR merchant_id = $1)\n        ORDER BY oldest_enqueued_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "merchant_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "network_type!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "chain_ref!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "chain_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "asset_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "asset_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "symbol?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "decimals!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "decimals"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "custody_address!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "custody_address"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "custody_kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "custody_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "authority_address?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "authority_address"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "movement_count!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "movement_count"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "total_amount!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 11,
+        "name": "oldest_enqueued_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "oldest_enqueued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "next_available_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "next_available_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "max_attempts!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "v_sweep_backlog",
+            "name": "max_attempts"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "8b8252e13c34877074befec0aa455c9a4721104e32bd69abea8dfc9317789beb"
+}

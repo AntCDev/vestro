@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM network_seen_blocks\n            WHERE network_type = $1 AND chain_ref = $2 AND scope = $3 AND block_number < $4\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "59a992db526e142da1365515a3b2061b78267b15bd2168eb57583eeaa7386b19"
+}

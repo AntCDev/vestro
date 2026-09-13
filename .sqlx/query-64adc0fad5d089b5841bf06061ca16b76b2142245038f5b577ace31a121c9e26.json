@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE payments\n                    SET block_number = $2, block_hash = $3, confirmations = $4,\n                        updated_at = CURRENT_TIMESTAMP\n                    WHERE id = $1 AND status <> 'orphaned'\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Varchar",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "64adc0fad5d089b5841bf06061ca16b76b2142245038f5b577ace31a121c9e26"
+}

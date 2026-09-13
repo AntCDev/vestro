@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT block_hash FROM network_seen_blocks\n                WHERE network_type = $1 AND chain_ref = $2 AND scope = $3 AND block_number = $4\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "block_hash",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "network_seen_blocks",
+            "name": "block_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bcd2c7e593fba0106f2554de3876d8d477d9e63b8e9ae02336c86ad0abb58ae5"
+}

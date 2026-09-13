@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO merchant_wallets (merchant_id, network_type, address)\n                VALUES ($1, $2, $3)\n                ON CONFLICT (merchant_id, network_type) DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "486adfe48e91c272640b4710b339f09b1b6e8de3f6793490851bb8825c9485e7"
+}

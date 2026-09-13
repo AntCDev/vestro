@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO payments\n                (invoice_id, tx_hash, amount, block_number, block_hash, confirmations, status, payment_path)\n            VALUES ($1, $2, $3, $4, $5, $6, 'detected', 'direct')\n            ON CONFLICT (invoice_id, tx_hash) DO NOTHING\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Numeric",
+        "Int8",
+        "Varchar",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3972f226e7c73e72f7ca69b37e900a2c767ad5f35cdbe097552498e20d2b2608"
+}

@@ -1,0 +1,116 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            r.merchant_id          AS \"merchant_id!\",\n            r.asset_id             AS \"asset_id!\",\n            r.symbol               AS \"symbol?\",\n            a.decimals             AS \"decimals!\",\n            r.network_type         AS \"network_type!\",\n            r.chain_ref            AS \"chain_ref!\",\n            r.ledger_unswept::text AS \"ledger_unswept!\",\n            r.queue_active::text   AS \"queue_active!\",\n            r.queue_abandoned::text AS \"queue_abandoned!\",\n            r.drift::text          AS \"drift!\"\n        FROM v_unswept_reconciliation r\n        JOIN assets a ON a.id = r.asset_id\n        WHERE ($1::uuid IS NULL OR r.merchant_id = $1)\n        ORDER BY r.network_type, r.chain_ref, r.symbol NULLS LAST\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "merchant_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_unswept_reconciliation",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "asset_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_unswept_reconciliation",
+            "name": "asset_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "symbol?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_unswept_reconciliation",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "decimals!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "decimals"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "network_type!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_unswept_reconciliation",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "chain_ref!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_unswept_reconciliation",
+            "name": "chain_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "ledger_unswept!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "queue_active!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "queue_abandoned!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "drift!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "ff518662044beae406f4335debc1b71d1157d9a94ace2717d0e1d4072e219bf1"
+}

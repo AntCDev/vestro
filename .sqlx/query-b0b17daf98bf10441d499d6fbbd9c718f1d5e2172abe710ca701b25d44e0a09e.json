@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT encrypted_secret, encryption_nonce FROM merchant_key_material WHERE merchant_id = $1 AND key_family = 'bip39'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "encrypted_secret",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "merchant_key_material",
+            "name": "encrypted_secret"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "encryption_nonce",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "merchant_key_material",
+            "name": "encryption_nonce"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b0b17daf98bf10441d499d6fbbd9c718f1d5e2172abe710ca701b25d44e0a09e"
+}

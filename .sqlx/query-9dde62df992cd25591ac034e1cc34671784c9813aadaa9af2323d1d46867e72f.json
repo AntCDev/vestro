@@ -1,0 +1,156 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            merchant_id            AS \"merchant_id!\",\n            asset_id               AS \"asset_id!\",\n            network_type           AS \"network_type!\",\n            chain_ref              AS \"chain_ref!\",\n            symbol                 AS \"symbol?\",\n            decimals               AS \"decimals!\",\n            asset_registered       AS \"asset_registered!\",\n            unswept::text          AS \"unswept!\",\n            treasury::text         AS \"treasury!\",\n            gas::text              AS \"gas!\",\n            unsupported::text      AS \"unsupported!\",\n            owed_to_merchant::text AS \"owed_to_merchant!\",\n            fees_owed_by_merchant::text AS \"fees_owed_by_merchant!\",\n            gas_advanced::text     AS \"gas_advanced!\",\n            unexplained::text      AS \"unexplained!\"\n        FROM v_merchant_positions\n        WHERE ($1::uuid IS NULL OR merchant_id = $1)\n        ORDER BY network_type, chain_ref, symbol NULLS LAST\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "merchant_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "asset_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "asset_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "network_type!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "chain_ref!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "chain_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "symbol?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "decimals!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "decimals"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "asset_registered!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "v_merchant_positions",
+            "name": "asset_registered"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "unswept!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "treasury!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "gas!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 10,
+        "name": "unsupported!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 11,
+        "name": "owed_to_merchant!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 12,
+        "name": "fees_owed_by_merchant!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 13,
+        "name": "gas_advanced!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 14,
+        "name": "unexplained!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "9dde62df992cd25591ac034e1cc34671784c9813aadaa9af2323d1d46867e72f"
+}

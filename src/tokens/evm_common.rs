@@ -1,8 +1,10 @@
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-
+use crate::keys::derivation::purpose;
+use crate::keys::wallets::wallet_address;
 use crate::networks::evm::EVMNetwork;
+use crate::networks::NetworkClient;
 use crate::tokens::{CheckoutContext};
 
 #[derive(Debug, Clone)]
@@ -74,7 +76,24 @@ pub async fn evm_checkout_data(
         ));
     }
 
-    let merchant_wallet = network.merchant_wallet(pool, ctx.merchant_id).await?;
+    let merchant_wallet = match wallet_address(
+        pool,
+        ctx.merchant_id,
+        network.network_type(),
+        purpose::MAIN,
+    ).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            // Degrade to the naive path rather than failing checkout. The
+            // deposit address is already derived and payable; only the vault
+            // call needs a destination. Mirrors the Solana handler's warning.
+            eprintln!(
+                "merchant {} has no 'main' wallet on {}: {e} — serving naive path only",
+                ctx.merchant_id, network.network_type()
+            );
+            return Ok(out);
+        }
+    };
 
     // Args are self-describing so a view can either map positionally
     // (args.map(a => a.value)) or check names against the abi string.

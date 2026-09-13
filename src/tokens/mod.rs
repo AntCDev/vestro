@@ -11,7 +11,6 @@
 //! a capability here — see the note at the top of `invoicer.rs`.
 
 pub mod checkout;
-pub mod crypto;
 pub mod handler;
 pub mod invoicer;
 pub mod registry;
@@ -27,10 +26,10 @@ pub mod base_sepolia;
 pub mod sepolia;
 pub mod sol_devnet;
 
-pub use checkout::{CheckoutContext, CheckoutView, PresignContext, StatusContext, GENERIC_VIEW};
-pub use handler::{Capabilities, HandlerStatus, TokenDescriptor, TokenHandler, TokenSummary};
-pub use invoicer::{Invoicer, PaymentDetails};
+pub use checkout::{CheckoutContext, PresignContext, StatusContext};
+pub use handler::{TokenHandler, TokenSummary};
+pub use invoicer::Invoicer;
 pub use registry::TokenRegistry;
-pub use sweeper::{SweepOutcome, SweepRequest, Sweeper};
+pub use sweeper::Sweeper;
 
-pub use crypto::{decrypt_data, load_merchant_mnemonic};
+pub use crate::keys::crypto::decrypt_data;

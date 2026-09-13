@@ -21,6 +21,13 @@
 //! the per-address call to exactly one request that carries amount, txid,
 //! confirmation state and block location together, so detection, confirmation
 //! and reorg handling all fall out of the same response.
+//!
+//! Ledger integration: every write point here mirrors the EVM watcher.
+//!   insert_payment      → record_detected   (one movement per vout paying us)
+//!   promote (merchant)  → mark_confirmed
+//!   promote (final)     → recognize_payment (Custody = the deposit address itself)
+//!   orphan_payment      → orphan            (Finality::Probabilistic)
+//!   relocation          → record_detected with no transfers (chain layer only)
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -31,6 +38,7 @@ use async_trait::async_trait;
 use bech32::{segwit, Hrp};
 use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use ripemd::Ripemd160;
@@ -38,13 +46,16 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::Mutex;
 use uuid::Uuid;
-
-use super::{enqueue_webhook, Amount, BitcoinNetwork, NetworkClient, PaymentWatch};
+use crate::keys::derivation::{DerivationScheme, DerivedAddress, KeyRole, SCHEME_VERSION};
+use crate::keys::store::assert_scheme;
+use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets};
+use crate::ledgerer::{AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer, ObservedInbound, ObservedTransfer, OrphanInput, OrphanOutcome, PaymentPath, RecognizeInput};
+use super::{enqueue_webhook, Amount, BitcoinNetwork, GasModel, NetworkClient, PaymentWatch};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -53,7 +64,7 @@ use super::{enqueue_webhook, Amount, BitcoinNetwork, NetworkClient, PaymentWatch
 /// The one network string. `invoices.network_type`, `merchant_wallets.network_type`,
 /// `network_scan_state.network_type` and `network_seen_blocks.network_type` all
 /// use it. Never 'btc', never 'bitcoin' — `bitcoin*` is the `chain_ref`.
-const NETWORK_TYPE: &str = "esplora";
+const NETWORK_TYPE: &str = crate::assets::NETWORK_ESPLORA;
 
 /// Only one scanner keeps a block cursor here, so one scope.
 const SCAN_SCOPE_CHAIN: &str = "chain";
@@ -125,6 +136,31 @@ const WATCH_GRACE_MINUTES: i32 = 60;
 const ADDRESS_TX_PAGE_SATURATED: usize = 50;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Derivation scheme
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// BIP84 with the role in the account slot. `KeyRole::Deposit` (0) is
+/// `m/84'/0'/0'/0/*` — a standard BIP84 external chain, so a merchant can
+/// recover mainnet funds with any BIP84 wallet. Index 0 is the main wallet,
+/// 1+ are per-invoice deposit addresses. `KeyRole::Operational` (1) is unused:
+/// UTXO chains are `GasModel::InputFunded` and have no feeder.
+///
+/// One coin type for the whole family. testnet4 and signet derive the same
+/// keys as mainnet and differ only in HRP; cross-chain address uniqueness is
+/// guaranteed by the family-wide deposit index counter, not by the path.
+pub const ESPLORA_COIN_TYPE: u32 = 0;
+pub const ESPLORA_TEMPLATE: &str = "m/84'/{coin}'/{role}'/0/{index}";
+
+pub fn esplora_scheme() -> DerivationScheme {
+    DerivationScheme {
+        network_type: NETWORK_TYPE,
+        coin_type: ESPLORA_COIN_TYPE,
+        template: ESPLORA_TEMPLATE,
+        version: SCHEME_VERSION,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Esplora wire types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -134,6 +170,9 @@ pub struct EsploraTxStatus {
     pub confirmed: bool,
     pub block_height: Option<u64>,
     pub block_hash: Option<String>,
+    /// Unix seconds. Present iff confirmed. Becomes `occurred_at` on the
+    /// recognition journal, so fee rates resolve at block time, not tick time.
+    pub block_time: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -144,8 +183,17 @@ pub struct EsploraVout {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct EsploraVin {
+    #[serde(default)]
+    pub is_coinbase: bool,
+    pub prevout: Option<EsploraVout>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct EsploraTx {
     pub txid: String,
+    #[serde(default)]
+    pub vin: Vec<EsploraVin>,
     pub vout: Vec<EsploraVout>,
     pub status: EsploraTxStatus,
 }
@@ -199,7 +247,13 @@ impl fmt::Display for ApiError {
 #[derive(Debug, Clone)]
 struct Watched {
     invoice_id: Uuid,
+    merchant_id: Uuid,
+    /// The route the invoice was created with. Snapshotted into journal
+    /// metadata by the Ledgerer; never an identity.
+    token_id: String,
     address: String,
+    /// Deposit index of `address`. Becomes `sweep_queue.authority_ref`.
+    wallet_index: Option<i32>,
     amount_requested: u128,
     required_confirmations: i64,
 }
@@ -229,55 +283,39 @@ pub struct EsploraNetwork {
     api_urls: Vec<String>,
     client: reqwest::Client,
 
-    /// `invoices.chain_ref`. Must equal the token config's `network_label`.
+    /// The one chain identifier. `NetworkClient::chain_ref()` returns exactly
+    /// this; `invoices.chain_ref`, `assets.chain_ref` and the token config's
+    /// `network_label` must all equal it.
     chain_ref: &'static str,
-    /// `merchant_network_indices.network`. Namespaced per chain so mainnet,
-    /// testnet4 and signet never share an index counter.
-    index_namespace: String,
-
-    coin_type: u32,
-    account: u32,
     hrp: &'static str,
 
-    /// Written by the chain watcher, read by the address watcher. A hint in the
-    /// sense that a stale value only delays a promotion by one tick.
     tip_height: AtomicU64,
     endpoint_cursor: AtomicUsize,
-
-    /// txid -> consecutive ticks the chain has denied it. Hint only (see
-    /// ORPHAN_STRIKES).
     orphan_strikes: Mutex<HashMap<String, u8>>,
-    /// Rebuilt from the DB every tick. Never a source of truth.
     pending: Mutex<HashMap<Uuid, PaymentWatch>>,
+
+    ledger: Ledgerer,
 }
+
 
 /// The `chain_ref` for a Bitcoin network. The token config's `network_label`
 /// must agree with this — ideally by calling it rather than repeating it.
 pub fn chain_ref_for(network: BitcoinNetwork) -> &'static str {
     match network {
-        BitcoinNetwork::Mainnet => "bitcoin",
-        BitcoinNetwork::Testnet4 => "bitcoin_testnet4",
-        BitcoinNetwork::Signet => "bitcoin_signet",
+        BitcoinNetwork::Mainnet => "mainnet",
+        BitcoinNetwork::Testnet4 => "testnet4",
+        BitcoinNetwork::Signet => "signet",
     }
 }
 
+
 impl EsploraNetwork {
     pub fn new(network: BitcoinNetwork, api_urls: Vec<String>) -> Self {
-        assert!(
-            !api_urls.is_empty(),
-            "EsploraNetwork requires at least one API URL"
-        );
+        assert!(!api_urls.is_empty(), "EsploraNetwork requires at least one API URL");
 
-        let chain_ref = chain_ref_for(network);
-
-        // BIP84. testnet4 and signet share coin type 1, so signet is separated
-        // by account index instead — otherwise the same merchant seed would
-        // derive identical addresses on both, and two invoices on two networks
-        // could collide on one address.
-        let (coin_type, account, hrp) = match network {
-            BitcoinNetwork::Mainnet => (0u32, 0u32, "bc"),
-            BitcoinNetwork::Testnet4 => (1u32, 0u32, "tb"),
-            BitcoinNetwork::Signet => (1u32, 1u32, "tb"),
+        let hrp = match network {
+            BitcoinNetwork::Mainnet => "bc",
+            BitcoinNetwork::Testnet4 | BitcoinNetwork::Signet => "tb",
         };
 
         let client = reqwest::Client::builder()
@@ -290,25 +328,34 @@ impl EsploraNetwork {
             network,
             api_urls,
             client,
-            chain_ref,
-            index_namespace: format!("{NETWORK_TYPE}:{chain_ref}"),
-            coin_type,
-            account,
+            chain_ref: chain_ref_for(network),
             hrp,
             tip_height: AtomicU64::new(0),
             endpoint_cursor: AtomicUsize::new(0),
             orphan_strikes: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            ledger: Ledgerer::new(),
         }
-    }
-
-    pub fn chain_ref(&self) -> &'static str {
-        self.chain_ref
     }
 
     pub fn network(&self) -> BitcoinNetwork {
         self.network
     }
+
+    fn chain(&self) -> ChainRef {
+        ChainRef::new(NETWORK_TYPE, self.chain_ref)
+    }
+
+    /// The only asset this family has. Requires an `assets` row for
+    /// (esplora, <chain_ref>, native, NULL) — `sync_assets` must run first.
+    fn asset(&self) -> AssetKey {
+        AssetKey::native(self.chain())
+    }
+
+    fn block_time_of(st: &EsploraTxStatus) -> Option<DateTime<Utc>> {
+        st.block_time.and_then(|t| DateTime::<Utc>::from_timestamp(t as i64, 0))
+    }
+
 
     // ── HTTP ────────────────────────────────────────────────────────────────
     //
@@ -386,38 +433,18 @@ impl EsploraNetwork {
         self.get_json(&format!("/blocks/{start_height}")).await
     }
 
-    // ── Derivation ──────────────────────────────────────────────────────────
+    // ── Addresses ───────────────────────────────────────────────────────────
 
-    fn derivation_path(&self, index: u32) -> String {
-        format!(
-            "m/84'/{}'/{}'/0/{}",
-            self.coin_type, self.account, index
-        )
-    }
-
-    /// P2WPKH (native SegWit v0) from the merchant's own seed.
-    pub fn derive_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        let mnemonic_parsed =
-            Mnemonic::parse(mnemonic).map_err(|e| format!("Invalid mnemonic: {e}"))?;
-        let seed = mnemonic_parsed.to_seed("");
-
-        let path: DerivationPath = self
-            .derivation_path(index)
-            .parse()
-            .map_err(|e| format!("Failed to parse derivation path: {e}"))?;
-
-        let child_xprv = XPrv::derive_from_path(&seed, &path)
-            .map_err(|e| format!("Failed to derive child key at path: {e}"))?;
-
-        let public_key = child_xprv.private_key().public_key();
-        let point = public_key.to_encoded_point(true);
-
-        let sha = Sha256::digest(point.as_bytes());
-        let hash160 = Ripemd160::digest(sha);
-
+    /// Re-encode a segwit address under this chain's HRP. The scheme is
+    /// per-family, so the `main` wallet row holds one address string with
+    /// whichever HRP the representative client had at registration. The
+    /// witness program is identical across chains; only the prefix differs.
+    /// The sweeper must pass the stored sweep destination through this.
+    pub fn localize_address(&self, address: &str) -> Result<String, String> {
+        let (_, version, program) =
+            segwit::decode(address).map_err(|e| format!("not a segwit address: {e}"))?;
         let hrp = Hrp::parse(self.hrp).map_err(|e| format!("Invalid HRP prefix: {e}"))?;
-        segwit::encode(hrp, segwit::VERSION_0, &hash160)
-            .map_err(|e| format!("Bech32 encoding failed: {e}"))
+        segwit::encode(hrp, version, &program).map_err(|e| format!("Bech32 encoding failed: {e}"))
     }
 
     // ── Chain watcher ───────────────────────────────────────────────────────
@@ -682,7 +709,8 @@ impl EsploraNetwork {
         let rows = sqlx::query!(
             r#"
             SELECT p.id, p.tx_hash, p.amount, p.block_number, p.status,
-                   p.invoice_id, i.amount_requested, i.required_confirmations, i.wallet_address
+                   p.invoice_id, i.merchant_id, i.token_id, i.wallet_address, i.wallet_index,
+                   i.amount_requested, i.required_confirmations
             FROM payments p
             JOIN invoices i ON i.id = p.invoice_id
             WHERE i.network_type = $1
@@ -713,7 +741,10 @@ impl EsploraNetwork {
         for r in rows {
             let watched = Watched {
                 invoice_id: r.invoice_id,
+                merchant_id: r.merchant_id,
+                token_id: r.token_id,
                 address: r.wallet_address,
+                wallet_index: Some(r.wallet_index),
                 amount_requested: dec_to_u128(r.amount_requested),
                 required_confirmations: r
                     .required_confirmations
@@ -735,10 +766,7 @@ impl EsploraNetwork {
                 Ok(s) => Some(s),
                 Err(ApiError::NotFound) => None,
                 Err(e) => {
-                    eprintln!(
-                        "[esplora:{}] reverify {}: {e}",
-                        self.chain_ref, r.tx_hash
-                    );
+                    eprintln!("[esplora:{}] reverify {}: {e}", self.chain_ref, r.tx_hash);
                     continue;
                 }
             };
@@ -830,7 +858,8 @@ impl EsploraNetwork {
     async fn load_watch_set(&self, pool: &PgPool) -> Result<Vec<Watched>, String> {
         let rows = sqlx::query!(
             r#"
-            SELECT i.id, i.wallet_address, i.amount_requested, i.required_confirmations
+            SELECT i.id, i.merchant_id, i.token_id, i.wallet_address, i.wallet_index,
+                   i.amount_requested, i.required_confirmations
             FROM invoices i
             WHERE i.network_type = $1
               AND i.chain_ref = $2
@@ -862,7 +891,10 @@ impl EsploraNetwork {
             .into_iter()
             .map(|r| Watched {
                 invoice_id: r.id,
+                merchant_id: r.merchant_id,
+                token_id: r.token_id,
                 address: r.wallet_address,
+                wallet_index: Some(r.wallet_index),
                 amount_requested: dec_to_u128(r.amount_requested),
                 required_confirmations: r
                     .required_confirmations
@@ -876,10 +908,7 @@ impl EsploraNetwork {
     /// state and block location, so detection, promotion and orphaning all come
     /// out of it.
     async fn process_invoice(&self, pool: &PgPool, w: &Watched, tip: u64) -> Result<(), String> {
-        let txs: Vec<EsploraTx> = match self
-            .get_json(&format!("/address/{}/txs", w.address))
-            .await
-        {
+        let txs: Vec<EsploraTx> = match self.get_json(&format!("/address/{}/txs", w.address)).await {
             Ok(v) => v,
             Err(ApiError::NotFound) => Vec::new(),
             Err(e) => return Err(e.to_string()),
@@ -897,26 +926,28 @@ impl EsploraNetwork {
         let mut seen: HashSet<String> = HashSet::new();
 
         for tx in &txs {
-            // Credit is outputs paying *us*. A sweep spending from this address
-            // shows up here too and contributes zero, which is what we want.
-            let credited: u128 = tx
+            // Outputs paying *us*, by vout index. Each is its own UTXO and its
+            // own chain_movement, so the sweeper gets one queue row per
+            // spendable output. A sweep spending from this address shows up
+            // here too and contributes nothing.
+            let outputs: Vec<(u32, u64)> = tx
                 .vout
                 .iter()
-                .filter(|o| o.scriptpubkey_address.as_deref() == Some(w.address.as_str()))
-                .map(|o| o.value as u128)
-                .sum();
+                .enumerate()
+                .filter(|(_, o)| o.scriptpubkey_address.as_deref() == Some(w.address.as_str()))
+                .map(|(n, o)| (n as u32, o.value))
+                .collect();
 
-            if credited == 0 {
+            if outputs.is_empty() {
                 continue;
             }
             seen.insert(tx.txid.clone());
 
             match existing.get(&tx.txid) {
-                None => self.insert_payment(pool, w, tx, credited, tip).await?,
+                None => self.insert_payment(pool, w, tx, &outputs, tip).await?,
                 Some(row) => {
                     self.clear_strike(&tx.txid).await;
-                    self.apply_chain_state(pool, w, row, Some(&tx.status), tip)
-                        .await?;
+                    self.apply_chain_state(pool, w, row, Some(&tx.status), tip).await?;
                 }
             }
         }
@@ -925,22 +956,15 @@ impl EsploraNetwork {
             return Ok(());
         }
 
-        // Anything we hold that the address no longer lists: confirm it really
-        // is gone before touching it. RBF replacement and mempool eviction both
-        // land here.
         for (txid, row) in existing.iter() {
             if seen.contains(txid) || row.status == "orphaned" {
                 continue;
             }
 
-            match self
-                .get_json::<EsploraTxStatus>(&format!("/tx/{txid}/status"))
-                .await
-            {
+            match self.get_json::<EsploraTxStatus>(&format!("/tx/{txid}/status")).await {
                 Ok(status) => {
                     self.clear_strike(txid).await;
-                    self.apply_chain_state(pool, w, row, Some(&status), tip)
-                        .await?;
+                    self.apply_chain_state(pool, w, row, Some(&status), tip).await?;
                 }
                 Err(ApiError::NotFound) => {
                     if self.strike(txid).await >= ORPHAN_STRIKES {
@@ -998,12 +1022,14 @@ impl EsploraNetwork {
         pool: &PgPool,
         w: &Watched,
         tx: &EsploraTx,
-        credited: u128,
+        outputs: &[(u32, u64)],
         tip: u64,
     ) -> Result<(), String> {
+        let credited: u128 = outputs.iter().map(|(_, v)| *v as u128).sum();
         let height = tx.status.block_height.unwrap_or(0);
         let confirmed = tx.status.confirmed && height > 0;
         let confirmations = if confirmed { confirmations_for(height, tip) } else { 0 };
+        let block_time = Self::block_time_of(&tx.status);
 
         let mut db = pool.begin().await.map_err(|e| e.to_string())?;
 
@@ -1027,34 +1053,72 @@ impl EsploraNetwork {
             .map_err(|e| format!("insert payment: {e}"))?;
 
         let Some(inserted) = inserted else {
-            // Another tick beat us to it. Nothing to do, nothing to fire.
             db.rollback().await.ok();
             return Ok(());
         };
+        let payment_id = inserted.id;
+
+        // Payer side is informational. A tx has N inputs and no "sender"; we
+        // take the first non-coinbase input's address. Always External — the
+        // only addresses this family owns are deposit and main wallets, and a
+        // merchant paying their own invoice from their main wallet is not a
+        // case worth a lookup per tx.
+        let from_address = tx
+            .vin
+            .iter()
+            .filter(|v| !v.is_coinbase)
+            .find_map(|v| v.prevout.as_ref().and_then(|p| p.scriptpubkey_address.clone()));
+
+        let transfers = outputs
+            .iter()
+            .map(|(n, sats)| ObservedTransfer {
+                event_index: *n as i32,
+                event_ref: Some(format!("vout:{n}")),
+                asset: self.asset(),
+                amount: Decimal::from(*sats),
+                from_address: from_address.clone(),
+                from_kind: Some(AddressKind::External),
+                to_address: Some(w.address.clone()),
+                to_kind: Some(AddressKind::DepositAddress),
+                merchant_id: Some(w.merchant_id),
+                invoice_id: Some(w.invoice_id),
+                payment_id: Some(payment_id),
+                token_id: Some(w.token_id.clone()),
+            })
+            .collect();
+
+        // Chain layer, same transaction. Mempool payments carry no block; the
+        // relocation in apply_chain_state fills it in when the tx is mined.
+        self.ledger
+            .record_detected(
+                &mut *db,
+                &ObservedInbound {
+                    chain: self.chain(),
+                    tx_hash: tx.txid.clone(),
+                    block_number: confirmed.then_some(height as i64),
+                    block_hash: if confirmed { tx.status.block_hash.clone() } else { None },
+                    block_time,
+                    merchant_id: Some(w.merchant_id),
+                    token_id: None, // observed, not initiated; route is on each movement
+                    transfers,
+                },
+            )
+            .await?;
 
         let totals = settle_invoice(&mut db, w.invoice_id).await?;
 
         let mut fields = payment_fields(w, &tx.txid, credited, confirmations, confirmed.then_some(height));
         fields.insert("amount_received".into(), Value::String(totals.received.to_string()));
         fields.insert("amount_expected".into(), Value::String(totals.requested.to_string()));
-        enqueue_webhook(&mut db, w.invoice_id, "payment.detected", &tx.txid, fields).await;
+        let dedupe_key = format!("payment.detected:{}:{}", w.invoice_id, tx.txid);
+        enqueue_webhook(&mut db, w.invoice_id, "payment.detected", &dedupe_key, fields).await?;
 
-        // A transaction can be first seen already deep — promote in the same
-        // transaction rather than waiting a tick.
         if confirmed {
-            promote(
-                &mut db,
-                w,
-                inserted.id,
-                &tx.txid,
-                credited,
-                confirmations,
-                height,
-            )
+            self.promote(&mut db, w, payment_id, &tx.txid, credited, confirmations, height, block_time)
                 .await?;
         }
 
-        maybe_finish(&mut db, w, &totals).await;
+        maybe_finish(&mut db, w, &totals).await?;
 
         db.commit().await.map_err(|e| e.to_string())?;
         Ok(())
@@ -1074,16 +1138,14 @@ impl EsploraNetwork {
             Some(st) if st.confirmed && st.block_height.is_some() => {
                 let height = st.block_height.unwrap();
                 let confirmations = confirmations_for(height, tip);
+                let block_time = Self::block_time_of(st);
 
-                // Nothing left to do for a final payment still sitting where we
-                // left it.
                 if row.status == "system_confirmed" && row.block_number == height as i64 {
                     return Ok(());
                 }
 
                 let mut db = pool.begin().await.map_err(|e| e.to_string())?;
 
-                // Re-mined after a reorg: back into the flow at `detected`.
                 let resurrected = sqlx::query!(
                     r#"
                     UPDATE payments SET status = 'detected', updated_at = CURRENT_TIMESTAMP
@@ -1097,7 +1159,6 @@ impl EsploraNetwork {
                     .map_err(|e| format!("resurrect: {e}"))?
                     .is_some();
 
-                // Location and depth only. The amount is never rewritten.
                 sqlx::query!(
                     r#"
                     UPDATE payments
@@ -1114,32 +1175,45 @@ impl EsploraNetwork {
                     .await
                     .map_err(|e| format!("update location: {e}"))?;
 
-                let promoted = promote(
-                    &mut db,
-                    w,
-                    row.id,
-                    &row.tx_hash,
-                    row.amount,
-                    confirmations,
-                    height,
-                )
+                // Relocate the chain_transactions row to match: mempool → block,
+                // or old block → new block after a reorg. Also flips an orphaned
+                // chain row back to `detected`. No transfers — the movements were
+                // appended at detection and a re-landed tx has the same vouts.
+                // A pre-ledger payment with no chain row gets one here with no
+                // movements, and recognize_payment will then refuse it loudly
+                // with NoMovementForPayment, which is the right failure.
+                self.ledger
+                    .record_detected(
+                        &mut *db,
+                        &ObservedInbound {
+                            chain: self.chain(),
+                            tx_hash: row.tx_hash.clone(),
+                            block_number: Some(height as i64),
+                            block_hash: st.block_hash.clone(),
+                            block_time,
+                            merchant_id: Some(w.merchant_id),
+                            token_id: None,
+                            transfers: Vec::new(),
+                        },
+                    )
+                    .await?;
+
+                let promoted = self
+                    .promote(&mut db, w, row.id, &row.tx_hash, row.amount, confirmations, height, block_time)
                     .await?;
 
                 if resurrected || promoted {
                     let totals = settle_invoice(&mut db, w.invoice_id).await?;
-                    maybe_finish(&mut db, w, &totals).await;
+                    maybe_finish(&mut db, w, &totals).await?;
                 }
 
                 db.commit().await.map_err(|e| e.to_string())?;
                 Ok(())
             }
 
-            // Known to the chain but unmined. Fine if it was always a mempool
-            // payment; a demotion from a block means it was reorged out.
             Some(_) => {
                 if row.block_number > MEMPOOL_BLOCK_SENTINEL {
-                    self.orphan_payment(pool, w, row, "reorged into mempool")
-                        .await
+                    self.orphan_payment(pool, w, row, "reorged into mempool").await
                 } else {
                     Ok(())
                 }
@@ -1160,7 +1234,7 @@ impl EsploraNetwork {
 
         let orphaned = sqlx::query!(
             r#"
-            UPDATE payments SET status = 'orphaned', updated_at = CURRENT_TIMESTAMP
+            UPDATE payments SET status = 'orphaned', confirmations = 0, updated_at = CURRENT_TIMESTAMP
             WHERE id = $1 AND status <> 'orphaned'
             RETURNING id
             "#,
@@ -1175,19 +1249,61 @@ impl EsploraNetwork {
             return Ok(());
         }
 
+        // §5.1: Bitcoin finality is probabilistic, so a recognized journal here
+        // is a legitimate case and gets a reversal. SweepInFlight is the one
+        // thing that refuses: value vanished under a sweep already claimed or
+        // broadcast. Roll back the payment flip too — the row must keep saying
+        // what the sweeper believed when it signed.
+        let outcome = self
+            .ledger
+            .orphan(
+                &mut *db,
+                &OrphanInput {
+                    chain: self.chain(),
+                    tx_hash: row.tx_hash.clone(),
+                    payment_id: row.id,
+                    finality: Finality::Probabilistic,
+                    reason: format!("{reason}; was at block {}", row.block_number),
+                },
+            )
+            .await;
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                if matches!(e, LedgerError::SweepInFlight { .. } | LedgerError::ImpossibleReversal { .. }) {
+                    eprintln!(
+                        "[esplora:{}] REFUSING to orphan payment {}: {e}",
+                        self.chain_ref, row.id
+                    );
+                }
+                db.rollback().await.ok();
+                return Err(e.to_string());
+            }
+        };
+
+        let reversed = match &outcome {
+            OrphanOutcome::Reversed { reversal_journal_id, .. } => {
+                println!(
+                    "[esplora:{}] payment {} was recognized; reversal journal {} written",
+                    self.chain_ref, row.id, reversal_journal_id
+                );
+                true
+            }
+            _ => false,
+        };
+
         let totals = settle_invoice(&mut db, w.invoice_id).await?;
 
         let mut fields = payment_fields(w, &row.tx_hash, row.amount, 0, None);
         fields.insert("reason".into(), Value::String(reason.to_string()));
-        fields.insert(
-            "amount_received".into(),
-            Value::String(totals.received.to_string()),
-        );
-        fields.insert(
-            "amount_expected".into(),
-            Value::String(totals.requested.to_string()),
-        );
-        enqueue_webhook(&mut db, w.invoice_id, "payment.orphaned", &row.tx_hash, fields).await;
+        fields.insert("ledger_reversed".into(), Value::Bool(reversed));
+        fields.insert("amount_received".into(), Value::String(totals.received.to_string()));
+        fields.insert("amount_expected".into(), Value::String(totals.requested.to_string()));
+
+        // Block in the key: orphaned → re-landed → orphaned again must fire twice.
+        let dedupe_key = format!("payment.orphaned:{}:{}", row.id, row.block_number);
+        enqueue_webhook(&mut db, w.invoice_id, "payment.orphaned", &dedupe_key, fields).await?;
 
         db.commit().await.map_err(|e| e.to_string())?;
 
@@ -1196,6 +1312,121 @@ impl EsploraNetwork {
             self.chain_ref, row.tx_hash, w.invoice_id
         );
         Ok(())
+    }
+
+    async fn promote(
+        &self,
+        db: &mut Transaction<'_, Postgres>,
+        w: &Watched,
+        payment_id: Uuid,
+        tx_hash: &str,
+        amount: u128,
+        confirmations: i64,
+        height: u64,
+        block_time: Option<DateTime<Utc>>,
+    ) -> Result<bool, String> {
+        let mut fired = false;
+
+        if confirmations >= w.required_confirmations {
+            let promoted = sqlx::query!(
+                r#"
+                UPDATE payments
+                SET status = 'merchant_confirmed', confirmations = $2, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND status = 'detected'
+                RETURNING id
+                "#,
+                payment_id,
+                confirmations as i32
+            )
+                .fetch_optional(&mut **db)
+                .await
+                .map_err(|e| format!("promote confirmed: {e}"))?;
+
+            if promoted.is_some() {
+                fired = true;
+                self.ledger.mark_confirmed(&mut **db, &self.chain(), tx_hash).await?;
+
+                let fields = payment_fields(w, tx_hash, amount, confirmations, Some(height));
+                let dedupe_key = format!("payment.confirmed:{payment_id}");
+                enqueue_webhook(db, w.invoice_id, "payment.confirmed", &dedupe_key, fields).await?;
+            }
+        }
+
+        if confirmations >= FINAL_CONFIRMATIONS {
+            let finalized = sqlx::query!(
+                r#"
+                UPDATE payments
+                SET status = 'system_confirmed', confirmations = $2, updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND status IN ('detected', 'merchant_confirmed')
+                RETURNING id
+                "#,
+                payment_id,
+                confirmations as i32
+            )
+                .fetch_optional(&mut **db)
+                .await
+                .map_err(|e| format!("promote finalized: {e}"))?;
+
+            if finalized.is_some() {
+                fired = true;
+
+                // §2.8: on a UTXO chain the deposit address is its own
+                // authority — the derived key at (Deposit, wallet_index) signs
+                // the input. Fees come out of the inputs, so no top-up and no
+                // fee payer. The outpoint is recoverable from the queue row:
+                // chain_transactions.tx_hash + chain_movements.event_ref
+                // ("vout:N") via movement_id. A sane sweeper batches every
+                // pending row for (merchant, asset) into one transaction with
+                // one output to the merchant's main wallet.
+                let custody = Custody {
+                    address: w.address.clone(),
+                    kind: AddressKind::DepositAddress,
+                    authority_address: w.address.clone(),
+                    authority_ref: w.wallet_index.map(|i| i.to_string()),
+                    sweep_params: json!({
+                        "chain_ref": self.chain_ref,
+                        "mechanism": "utxo_spend",
+                        "script_type": "p2wpkh",
+                        "aggregate_by": ["merchant_id", "asset_id"],
+                        "gas_topup_required": false,
+                        "external_fee_payer": false,
+                    }),
+                };
+
+                let outcome = self
+                    .ledger
+                    .recognize_payment(
+                        &mut **db,
+                        &RecognizeInput {
+                            chain: self.chain(),
+                            tx_hash: tx_hash.to_string(),
+                            payment_id,
+                            invoice_id: w.invoice_id,
+                            merchant_id: w.merchant_id,
+                            token_id: w.token_id.clone(),
+                            path: PaymentPath::Direct,
+                            block_time,
+                            custody: Some(custody),
+                            already_swept: false, // until payments.swept_by_tx_id exists
+                        },
+                    )
+                    .await?;
+
+                if let Some(j) = outcome.journal_id {
+                    println!(
+                        "[esplora:{}] payment {} recognized: journal {} amount {} fee {} ({} bps), {} sweep row(s)",
+                        self.chain_ref, payment_id, j, outcome.amount, outcome.fee,
+                        outcome.fee_bps, outcome.sweep_rows_enqueued
+                    );
+                }
+
+                let fields = payment_fields(w, tx_hash, amount, confirmations, Some(height));
+                let dedupe_key = format!("payment.finalized:{payment_id}");
+                enqueue_webhook(db, w.invoice_id, "payment.finalized", &dedupe_key, fields).await?;
+            }
+        }
+
+        Ok(fired)
     }
 
     /// Expire only invoices that never saw anything. An invoice with any
@@ -1249,9 +1480,27 @@ impl EsploraNetwork {
     }
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared write helpers
 // ─────────────────────────────────────────────────────────────────────────────
+async fn maybe_finish(
+    db: &mut Transaction<'_, Postgres>,
+    w: &Watched,
+    totals: &InvoiceTotals,
+) -> Result<(), String> {
+    if !totals.finished_now {
+        return Ok(());
+    }
+    let mut fields = Map::new();
+    fields.insert("network".into(), Value::String(NETWORK_TYPE.into()));
+    fields.insert("address".into(), Value::String(w.address.clone()));
+    fields.insert("amount_received".into(), Value::String(totals.received.to_string()));
+    fields.insert("amount_expected".into(), Value::String(totals.requested.to_string()));
+    let dedupe_key = format!("payment.finished:{}", w.invoice_id);
+    enqueue_webhook(db, w.invoice_id, "payment.finished", &dedupe_key, fields).await
+}
+
 
 /// Both confirmation latches, in order, guarded so each can only fire once.
 /// Returns whether either fired.
@@ -1387,24 +1636,6 @@ async fn settle_invoice(
     })
 }
 
-async fn maybe_finish(db: &mut Transaction<'_, Postgres>, w: &Watched, totals: &InvoiceTotals) {
-    if !totals.finished_now {
-        return;
-    }
-    let mut fields = Map::new();
-    fields.insert("network".into(), Value::String(NETWORK_TYPE.into()));
-    fields.insert("address".into(), Value::String(w.address.clone()));
-    fields.insert(
-        "amount_received".into(),
-        Value::String(totals.received.to_string()),
-    );
-    fields.insert(
-        "amount_expected".into(),
-        Value::String(totals.requested.to_string()),
-    );
-    enqueue_webhook(db, w.invoice_id, "payment.finished", "invoice", fields).await;
-}
-
 fn payment_fields(
     w: &Watched,
     tx_hash: &str,
@@ -1511,50 +1742,67 @@ fn base58check_decode(s: &str) -> Option<Vec<u8>> {
 #[async_trait]
 impl NetworkClient for EsploraNetwork {
     fn network_type(&self) -> &'static str {
-        crate::assets::NETWORK_ESPLORA
+        NETWORK_TYPE
     }
 
     fn chain_ref(&self) -> String {
-        match self.network {
-            BitcoinNetwork::Mainnet => "mainnet".to_string(),
-            BitcoinNetwork::Testnet4 => "testnet4".to_string(),
-            BitcoinNetwork::Signet => "signet".to_string(),
-        }
+        self.chain_ref.to_string()
     }
-    async fn get_derive_address(
+
+    /// Fees come out of the inputs being spent. No feeder, no top-up.
+    fn gas_model(&self) -> GasModel {
+        GasModel::InputFunded
+    }
+
+    fn derivation_scheme(&self) -> DerivationScheme {
+        esplora_scheme()
+    }
+    // required_wallets: trait default (main only). No operational keys.
+    // canonicalize_address: trait default. bech32 from `segwit::encode` is
+    // already lowercase and must not be otherwise touched.
+
+    /// P2WPKH from the merchant's own seed. The only path from mnemonic to
+    /// address in this family; `next_deposit_address` and wallet provisioning
+    /// both come through here.
+    fn derive(&self, mnemonic: &str, role: KeyRole, index: u32) -> Result<DerivedAddress, String> {
+        let scheme = esplora_scheme();
+        let seed = scheme.seed(mnemonic)?;
+        let path = scheme.path(role, index)?;
+
+        let xprv = XPrv::derive_from_path(&seed, &path).map_err(|e| {
+            format!("Failed to derive at {}: {e}", scheme.path_string(role, index))
+        })?;
+
+        let point = xprv.private_key().public_key().to_encoded_point(true);
+        let hash160 = Ripemd160::digest(Sha256::digest(point.as_bytes()));
+
+        let hrp = Hrp::parse(self.hrp).map_err(|e| format!("Invalid HRP prefix: {e}"))?;
+        let address = segwit::encode(hrp, segwit::VERSION_0, &hash160)
+            .map_err(|e| format!("Bech32 encoding failed: {e}"))?;
+
+        Ok(DerivedAddress {
+            address,
+            role,
+            index,
+            path: scheme.path_string(role, index),
+            scheme_version: scheme.version,
+            reference: None,
+        })
+    }
+
+    async fn next_deposit_address(
         &self,
         pool: &PgPool,
         merchant_id: Uuid,
         _invoice_id: Uuid,
         mnemonic: &str,
-    ) -> Result<(String, u32, Option<String>), String> {
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
-            VALUES ($1, $2, 0, 1)
-            ON CONFLICT (merchant_id, network, account_index)
-            DO UPDATE SET
-                next_index = merchant_network_indices.next_index + 1,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING next_index
-            "#,
-            merchant_id,
-            self.index_namespace
-        )
-            .fetch_one(pool)
-            .await
-            .map_err(|e| format!("Failed to update merchant network index: {e}"))?;
-
-        let index = (row.next_index - 1).max(0) as u32;
-        let address = self.derive_address(mnemonic, index)?;
-
-        // Bitcoin has no reference/memo primitive. The address is the only
-        // correlation key, and there is no smart path to carry anything else.
-        Ok((address, index, None))
-    }
-
-    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        self.derive_address(mnemonic, index)
+    ) -> Result<DerivedAddress, String> {
+        // Family-wide counter: mainnet, testnet4 and signet never hand out the
+        // same index, so identical keys under different HRPs never collide on
+        // an address. Index 0 is the main wallet and is never returned.
+        let index = allocate_deposit_index(pool, merchant_id, self.network_type()).await?;
+        // Bitcoin has no reference/memo primitive; `reference` stays None.
+        self.derive(mnemonic, KeyRole::Deposit, index)
     }
 
     fn validate_address(&self, address: &str) -> bool {
@@ -1621,15 +1869,22 @@ impl NetworkClient for EsploraNetwork {
 
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
         println!(
-            "🟠 Esplora watcher up: chain_ref={} endpoints={} path=m/84'/{}'/{}'/0/*",
+            "🟠 Esplora watcher up: chain_ref={} endpoints={} scheme={} (v{})",
             self.chain_ref,
             self.api_urls.len(),
-            self.coin_type,
-            self.account
+            ESPLORA_TEMPLATE,
+            SCHEME_VERSION
         );
 
-        // Both loops are infinite and swallow their own errors; neither can take
-        // the other down.
+        // 0. Code and DB must agree on the scheme before anything derives.
+        assert_scheme(pool, &self.derivation_scheme()).await?;
+
+        // 1. Main wallet for every merchant missing one. All three chains run
+        //    this; whichever gets there first writes the row, the others see
+        //    the purpose present and skip. See `localize_address` for why the
+        //    HRP on that row is not this chain's problem.
+        ensure_merchant_wallets(pool, self).await?;
+
         futures::future::join(self.chain_loop(pool), self.address_loop(pool)).await;
         Ok(())
     }

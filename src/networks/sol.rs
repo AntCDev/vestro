@@ -1,4 +1,4 @@
-use super::{decrypt_data, enqueue_webhook, Amount, NetworkClient, PaymentWatch, SolanaCluster};
+use super::{decrypt_data, enqueue_webhook, Amount, GasModel, NetworkClient, PaymentWatch, SolanaCluster};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use bip39::Mnemonic;
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use rust_decimal::Decimal;
-
+use crate::keys::derivation::*;
 
 
 use futures::stream::{self, StreamExt};
@@ -26,6 +26,8 @@ use tokio::sync::RwLock;
 
 use chrono::DateTime;
 use sqlx::Row;
+use crate::keys::store::assert_scheme;
+use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets};
 use crate::ledgerer::{
     AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
     ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
@@ -66,37 +68,48 @@ struct SolTokenAccountsValue {
 
 
 type HmacSha512 = Hmac<Sha512>;
-const SOLANA_HARDENED_OFFSET: u32 = 0x8000_0000;
 const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+pub const SOLANA_COIN_TYPE: u32 = 501;
+pub const SOLANA_TEMPLATE: &str = "m/44'/{coin}'/{role}'/{index}'";
+pub const SOLANA_HARDENED_OFFSET: u32 = 0x8000_0000;
+
+const SOLANA_REQUIRED_WALLETS: &[WalletSpec] = &[MAIN_WALLET, GAS_FEEDER_WALLET];
 
 // ---------- derivation path ----------
 
-/// Phantom/Solflare-style hardened path: m/44'/501'/{index}'/0'
-fn get_solana_derivation_path(index: u32) -> String {
-    format!("m/44'/501'/{}'/0'", index)
+pub fn solana_scheme() -> DerivationScheme {
+    DerivationScheme {
+        network_type: crate::assets::NETWORK_SOLANA,
+        coin_type: SOLANA_COIN_TYPE,
+        template: SOLANA_TEMPLATE,
+        version: SCHEME_VERSION,
+    }
 }
 
-/// SLIP-0010 only supports hardened derivation for ed25519, so every
-/// segment must end in `'`. Returns the raw (unhardened) u32 for each segment.
+/// SLIP-0010 ed25519 supports hardened derivation only, so every segment must
+/// end in `'`. Returns the RAW value per segment — `slip10_derive_child` adds
+/// the hardened offset itself, and handing it a pre-offset value would be
+/// wrong on any curve where that distinction matters.
+///
+/// This is also the reason the shared scheme hardens every level: a template
+/// with a soft segment would be underivable here while working fine on EVM,
+/// and the failure would show up as a boot error on one network only.
 fn parse_hardened_path(path: &str) -> Result<Vec<u32>, String> {
     path.trim_start_matches("m/")
         .split('/')
         .map(|segment| {
-            if !segment.ends_with('\'') {
-                return Err(format!(
-                    "SLIP-0010 ed25519 requires hardened segments, got: {}",
-                    segment
-                ));
-            }
             let raw = segment
-                .trim_end_matches('\'')
+                .strip_suffix('\'')
+                .ok_or_else(|| format!(
+                    "SLIP-0010 ed25519 requires hardened segments, got: {segment}"
+                ))?
                 .parse::<u32>()
-                .map_err(|_| format!("Invalid path segment: {}", segment))?;
+                .map_err(|_| format!("Invalid path segment: {segment}"))?;
             if raw >= SOLANA_HARDENED_OFFSET {
-                return Err(format!("Path segment out of range: {}", segment));
+                return Err(format!("Path segment out of range: {segment}"));
             }
             Ok(raw)
         })
@@ -134,13 +147,18 @@ fn slip10_derive_child(key: &[u8; 32], chain_code: &[u8; 32], index: u32) -> ([u
     (child_key, child_chain_code)
 }
 
-/// Walks m/44'/501'/{index}'/0' via SLIP-0010 and returns the ed25519 signing key.
-fn derive_solana_signing_key(mnemonic: &str, index: u32) -> Result<SigningKey, String> {
-    let mnemonic_parsed = Mnemonic::parse(mnemonic).map_err(|e| format!("Invalid mnemonic: {}", e))?;
-    let seed = mnemonic_parsed.to_seed("");
-
-    let path_str = get_solana_derivation_path(index);
-    let segments = parse_hardened_path(&path_str)?;
+/// Signing key and address from one walk of the path, so a fee payer can never
+/// sign with a key that doesn't match the address the DB says it has. This is
+/// the single derivation entry point for Solana — `derive_solana_address` is
+/// now just the `.1` of this.
+pub fn derive_solana_keypair(
+    mnemonic: &str,
+    role: KeyRole,
+    index: u32,
+) -> Result<(SigningKey, String), String> {
+    let scheme = solana_scheme();
+    let seed = scheme.seed(mnemonic)?;
+    let segments = parse_hardened_path(&scheme.path_string(role, index))?;
 
     let (mut key, mut chain_code) = slip10_master_key(&seed);
     for segment in segments {
@@ -149,14 +167,9 @@ fn derive_solana_signing_key(mnemonic: &str, index: u32) -> Result<SigningKey, S
         chain_code = child_chain_code;
     }
 
-    Ok(SigningKey::from_bytes(&key))
-}
-
-/// Derives the base58-encoded wallet (owner) address for a given index.
-fn derive_solana_address(mnemonic: &str, index: u32) -> Result<String, String> {
-    let signing_key = derive_solana_signing_key(mnemonic, index)?;
-    let public_key_bytes = signing_key.verifying_key().to_bytes();
-    Ok(bs58::encode(public_key_bytes).into_string())
+    let signing_key = SigningKey::from_bytes(&key);
+    let address = bs58::encode(signing_key.verifying_key().to_bytes()).into_string();
+    Ok((signing_key, address))
 }
 
 // ---------- ATA / PDA derivation (no solana-* crates) ----------
@@ -216,32 +229,6 @@ fn derive_associated_token_address(
     let (ata_bytes, _bump) = find_program_address(&seeds, &associated_token_program_bytes)?;
 
     Ok(bs58::encode(ata_bytes).into_string())
-}
-
-fn get_derivation_path(index: u32) -> String {
-    format!("m/44'/501'/{}'/0'", index)
-}
-fn parse_derivation_path(path: &str) -> Result<Vec<u32>, String> {
-    if !path.starts_with("m/") {
-        return Err("Path must start with 'm/'".to_string());
-    }
-    let mut indices = Vec::new();
-    for part in path["m/".len()..].split('/') {
-        if part.is_empty() { continue; }
-        let is_hardened = part.ends_with('\'');
-        let num_str = if is_hardened {
-            &part[..part.len() - 1]
-        } else {
-            part
-        };
-        let val: u32 = num_str.parse().map_err(|e| format!("Invalid path segment: {}", e))?;
-        if is_hardened {
-            indices.push(val | 0x8000_0000);
-        } else {
-            indices.push(val);
-        }
-    }
-    Ok(indices)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2480,69 +2467,6 @@ impl SolanaNetwork {
         let slot = self.get_slot(FINALIZED_COMMITMENT).await?;
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
     }
-
-    async fn ensure_merchant_wallets(&self, pool: &PgPool) -> Result<(), String> {
-        let master_key_hex = std::env::var("MASTER_KEY")
-            .map_err(|_| "MASTER_KEY environment variable not set".to_string())?;
-
-        let master_key_vec = hex::decode(&master_key_hex)
-            .map_err(|_| "MASTER_KEY must be a valid hex string".to_string())?;
-
-        let master_key: &[u8; 32] = master_key_vec
-            .as_slice()
-            .try_into()
-            .map_err(|_| "MASTER_KEY must be exactly 32 bytes".to_string())?;
-
-        let network_type_key = NETWORK_TYPE.to_lowercase();
-
-        // Find merchants missing a Solana wallet record
-        let uninitialized_merchants = sqlx::query!(
-            r#"
-            SELECT m.id, km.encrypted_secret, km.encryption_nonce
-            FROM merchants m
-            JOIN merchant_key_material km ON m.id = km.merchant_id
-            WHERE km.key_family = 'bip39'
-              AND NOT EXISTS (
-                  SELECT 1 FROM merchant_wallets mw
-                  WHERE mw.merchant_id = m.id AND LOWER(mw.network_type) = $1
-              )
-            "#,
-            network_type_key
-        )
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("Failed to query merchants missing SOL wallets: {e}"))?;
-
-        for record in uninitialized_merchants {
-            let decrypted_mnemonic_bytes = decrypt_data(master_key, &record.encrypted_secret, &record.encryption_nonce)
-                .map_err(|e| format!("Failed to decrypt mnemonic for merchant {}: {e}", record.id))?;
-
-            let mnemonic_phrase = String::from_utf8(decrypted_mnemonic_bytes)
-                .map_err(|e| format!("Invalid UTF-8 mnemonic for merchant {}: {e}", record.id))?;
-
-            // Derive Solana address at index 0
-            let sol_address = derive_solana_address(&mnemonic_phrase, 0)
-                .map_err(|e| format!("Failed to derive Solana wallet for merchant {}: {e}", record.id))?;
-
-            sqlx::query!(
-                r#"
-                INSERT INTO merchant_wallets (merchant_id, network_type, address)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (merchant_id, network_type) DO NOTHING
-                "#,
-                record.id,
-                network_type_key,
-                sol_address
-            )
-                .execute(pool)
-                .await
-                .map_err(|e| format!("Failed to save derived SOL wallet for merchant {}: {e}", record.id))?;
-
-            println!("Initialized SOL wallet ({}) for merchant {}", sol_address, record.id);
-        }
-
-        Ok(())
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2738,87 +2662,93 @@ fn i128_to_decimal(v: i128) -> Result<Decimal, String> {
 }
 #[async_trait]
 impl NetworkClient for SolanaNetwork {
-    fn network_type(&self) -> &'static str {
-        NETWORK_TYPE
+    fn network_type(&self) -> &'static str { NETWORK_TYPE }
+
+    fn chain_ref(&self) -> String { SolanaNetwork::chain_ref(self) }
+
+    fn derivation_scheme(&self) -> DerivationScheme { solana_scheme() }
+
+    fn required_wallets(&self) -> &'static [WalletSpec] { SOLANA_REQUIRED_WALLETS }
+
+    fn gas_model(&self) -> GasModel { GasModel::FeePayer }
+
+    fn derive(&self, mnemonic: &str, role: KeyRole, index: u32)
+              -> Result<DerivedAddress, String>
+    {
+        let scheme = solana_scheme();
+        let (_key, address) = derive_solana_keypair(mnemonic, role, index)?;
+        Ok(DerivedAddress {
+            address,
+            role,
+            index,
+            path: scheme.path_string(role, index),
+            scheme_version: scheme.version,
+            reference: None,
+        })
     }
 
-    fn chain_ref(&self) -> String {
-        SolanaNetwork::chain_ref(self)
-    }
-    // --- WALLET METHODS ---
-    async fn get_derive_address(
+    /// The HD-derived owner pubkey is simultaneously the deposit address (for
+    /// native SOL), the ATA *owner* (for SPL/Token-2022), and the Solana Pay
+    /// reference in both cases.
+    ///
+    /// `address` is therefore what a payer sends to, while `path`/`index`/
+    /// `reference` describe the OWNER — for SPL they are not the same account.
+    /// The ATA has no private key; the owner's key is what signs a sweep, so
+    /// the path recorded on the invoice is deliberately the owner's.
+    async fn next_deposit_address(
         &self,
         pool: &PgPool,
         merchant_id: Uuid,
         invoice_id: Uuid,
         mnemonic: &str,
-    ) -> Result<(String, u32, Option<String>), String> {
-        // NOTE: this read-back is the only reason `create_invoice_payment` has to
-        // commit token_address/token_program *before* calling here. If the trait
-        // signature is ever free to change, passing them in as arguments removes
-        // both the round trip and the ordering constraint.
+    ) -> Result<DerivedAddress, String> {
+        // NOTE: unchanged ordering constraint — the orchestrator must have
+        // committed token_address/token_program before this runs. Passing them
+        // in as arguments would remove both the round trip and the constraint;
+        // the trait signature is now ours to change, so this is a candidate.
         let invoice = sqlx::query!(
-        r#"
-        SELECT token_address, token_program
-        FROM invoices
-        WHERE id = $1
-        "#,
-        invoice_id
-    )
-            .fetch_one(pool)
-            .await
+            "SELECT token_address, token_program FROM invoices WHERE id = $1",
+            invoice_id
+        )
+            .fetch_one(pool).await
             .map_err(|e| format!("Failed to load invoice {invoice_id} for derivation: {e}"))?;
 
         let mint = invoice.token_address.filter(|m| !m.is_empty() && m != "0");
         let token_program = invoice.token_program.filter(|p| !p.is_empty() && p != "0");
 
-        // Fail loudly rather than defaulting to the legacy program. A wrong default
-        // produces a valid-looking address that nobody will ever pay into.
+        // Fail loudly rather than defaulting to the legacy program. A wrong
+        // default produces a valid-looking address nobody will ever pay into.
         if mint.is_some() && token_program.is_none() {
             return Err(format!(
                 "invoice {invoice_id}: token_address is set but token_program is NULL; \
-             refusing to guess the token program"
+                 refusing to guess the token program"
             ));
         }
 
-        let row = sqlx::query!(
-        r#"
-        INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
-        VALUES ($1, $2, 0, 1)
-        ON CONFLICT (merchant_id, network, account_index)
-        DO UPDATE SET
-            next_index = merchant_network_indices.next_index + 1,
-            updated_at = CURRENT_TIMESTAMP
-        RETURNING next_index
-        "#,
-        merchant_id,
-        NETWORK_TYPE
-    )
-            .fetch_one(pool)
-            .await
-            .map_err(|e| format!("Failed to update merchant network index: {e}"))?;
+        let index = allocate_deposit_index(pool, merchant_id, self.network_type()).await?;
+        let mut derived = self.derive(mnemonic, KeyRole::Deposit, index)?;
+        let owner_address = derived.address.clone();
 
-        // Directly use row.next_index so the sequence starts at 1
-        let index = u32::try_from(row.next_index)
-            .map_err(|_| format!("Invalid wallet index: {}", row.next_index))?;
-
-        // The HD-derived owner pubkey. This is simultaneously:
-        //   - the deposit address, when the invoice is for native SOL
-        //   - the ATA *owner*, when the invoice is for an SPL / Token-2022 mint
-        //   - the Solana Pay `reference` in both cases
-        let owner_address = derive_solana_address(mnemonic, index)?;
-
-        let deposit_address = match (&mint, &token_program) {
-            (Some(mint), Some(program)) => {
-                derive_associated_token_address(&owner_address, mint, program)?
-            }
+        derived.address = match (&mint, &token_program) {
+            (Some(mint), Some(program)) =>
+                derive_associated_token_address(&owner_address, mint, program)?,
             _ => owner_address.clone(),
         };
+        derived.reference = Some(owner_address);
 
-        Ok((deposit_address, index, Some(owner_address)))
+        Ok(derived)
     }
-    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        derive_solana_address(mnemonic, index)
+
+    async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
+        println!(
+            "SolanaNetwork::spin_up initializing for {} ({}/{})",
+            self.network_name, NETWORK_TYPE, self.chain_ref()
+        );
+
+        assert_scheme(pool, &self.derivation_scheme()).await?;
+        ensure_merchant_wallets(pool, self).await?;
+
+        self.watch_addresses(pool).await
     }
     fn validate_address(&self, address: &str) -> bool {
         todo!()
@@ -2837,20 +2767,5 @@ impl NetworkClient for SolanaNetwork {
     async fn get_current_block(&self) -> Result<u64, String> {
         let slot = self.get_slot(DETECT_COMMITMENT).await?;
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
-    }
-
-    async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
-        println!(
-            "SolanaNetwork::spin_up initializing for {} ({}/{})",
-            self.network_name,
-            NETWORK_TYPE,
-            self.chain_ref()
-        );
-
-        // 1. Backfill missing Solana addresses for all merchants at index 0
-        self.ensure_merchant_wallets(pool).await?;
-
-        // 2. Run Solana address watcher service
-        self.watch_addresses(pool).await
     }
 }

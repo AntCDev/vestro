@@ -10,7 +10,7 @@ use crate::assets::{AssetKey, AssetKind, AssetSpec, NETWORK_SOLANA};
 use crate::networks::sol::SolanaNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry, SolanaCluster};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView, PresignContext};
-use crate::tokens::crypto::load_merchant_mnemonic;
+use crate::keys::store::load_merchant_seed;
 use crate::tokens::handler::{TokenDescriptor, TokenHandler};
 use crate::tokens::invoicer::{Invoicer, PaymentDetails};
 use crate::tokens::registry::TokenRegistry;
@@ -169,89 +169,76 @@ impl Invoicer for DevnetHandler {
         _amount: rust_decimal::Decimal,
         _token_id: &str,
     ) -> Result<PaymentDetails, String> {
-        let merchant_mnemonic = load_merchant_mnemonic(pool, merchant_id).await?;
-
-        // token_address / token_program / token_decimals / network_type /
-        // chain_ref were written by the orchestrator from the advertised asset
-        // *before* this call, which is what get_derive_address reads back off
-        // the row to decide which program the ATA is derived under. The invoice
-        // is not yet visible to the watcher — wallet_address is still '' — so a
-        // crash anywhere in here leaves a row that is never polled and expires.
+        let merchant_mnemonic = load_merchant_seed(pool, merchant_id).await?;
         let mint = self.descriptor.asset.key.address.clone();
 
-        // The reference path is dead without this row, so surface it at creation
-        // time instead of letting the watcher log about it once per tick forever.
+        // The reference path is dead without this row, so surface it at creation time
+        // instead of letting the watcher log about it once per tick forever.
         let merchant_wallet = sqlx::query_scalar!(
-            r#"
-            SELECT address FROM merchant_wallets
-            WHERE merchant_id = $1 AND network_type = 'solana'
-            "#,
-            merchant_id
-        )
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("Failed to look up merchant wallet: {e}"))?;
+    r#"
+    SELECT address FROM merchant_wallets
+    WHERE merchant_id = $1 AND network_type = 'solana' AND purpose = 'main'
+    "#,
+    merchant_id
+)
+            .fetch_optional(pool).await
+            .map_err(|e| format!("Failed to look up merchant wallet: {e}"))?;
 
         if merchant_wallet.is_none() {
             eprintln!(
-                "merchant {merchant_id} has no merchant_wallets row for 'solana'; invoice \
-                 {invoice_id} will only be payable via the direct/QR path"
+                "merchant {merchant_id} has no 'main' merchant_wallets row for 'solana'; invoice \
+         {invoice_id} will only be payable via the direct/QR path"
             );
         }
 
-        let (deposit_address, derived_wallet_index, payment_reference) = self
+        let derived = self
             .network
-            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic)
+            .next_deposit_address(pool, merchant_id, invoice_id, &merchant_mnemonic)
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 
-        // TODO: merchant-configurable rather than a fixed half hour.
         let expires_at = Utc::now() + Duration::minutes(30);
 
-        // Deliberately the FINALIZED slot, not the processed/confirmed tip.
-        // `created_block` is a floor: anything below it predates the invoice. A
-        // tip reading can sit ahead of where the payer's transaction lands,
-        // which would throw away a real payment. Finalized is always behind, so
-        // erring here costs a few extra signatures to scan.
+        // Deliberately the FINALIZED slot, not the tip. `created_block` is a floor:
+        // a tip reading can sit ahead of where the payer's transaction lands.
         let current_slot = self
             .network
             .get_finalized_block()
             .await
             .map_err(|e| format!("Failed to fetch finalized slot: {e}"))? as i64;
 
-        // Setting wallet_address is what makes the invoice visible to the watcher.
         sqlx::query!(
-            r#"
-            UPDATE invoices
-            SET wallet_address = $1,
-                wallet_index = $2,
-                expires_at = $3,
-                payment_reference = $4,
-                required_confirmations = $5,
-                created_block = $6,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $7
-            "#,
-            deposit_address.as_str(),
-            derived_wallet_index as i32,
-            expires_at,
-            payment_reference.as_deref(),
-            self.config.required_confirmations as i16,
-            current_slot,
-            invoice_id
-        )
-        .execute(pool)
-        .await
-        .map_err(|e| format!("DB update failed: {e}"))?;
+    r#"
+    UPDATE invoices
+    SET wallet_address = $1, wallet_index = $2, wallet_role = $3,
+        wallet_path = $4, scheme_version = $5,
+        expires_at = $6, payment_reference = $7,
+        required_confirmations = $8, created_block = $9,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = $10
+    "#,
+    derived.address.as_str(),
+    derived.index as i32,
+    derived.role.as_i16(),
+    derived.path,
+    derived.scheme_version,
+    expires_at,
+    derived.reference.as_deref(),
+    self.config.required_confirmations as i16,
+    current_slot,
+    invoice_id
+)
+            .execute(pool).await
+            .map_err(|e| format!("DB update failed: {e}"))?;
 
         Ok(PaymentDetails {
             invoice_id,
             network: self.descriptor.chain.clone(),
-            deposit_address,
+            deposit_address: derived.address,
             token_address: mint,
             decimals: self.descriptor.asset.decimals,
             required_confirmations: self.config.required_confirmations,
-            wallet_index: derived_wallet_index,
+            wallet_index: derived.index,
             expires_at,
         })
     }

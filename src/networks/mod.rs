@@ -14,8 +14,8 @@ use argon2::{
     password_hash::{PasswordHasher, PasswordVerifier},
 };
 use sha2::{Digest};
-
-
+use crate::keys::crypto::decrypt_data;
+use crate::keys::derivation::{DerivationScheme, DerivedAddress, KeyRole, WalletSpec, MAIN_WALLET};
 
 pub mod evm;
 pub mod sol;
@@ -228,6 +228,20 @@ pub struct PaymentWatch {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Amount(pub u128);
 
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GasModel {
+    /// The signing address must itself hold native currency. A sweep is two
+    /// transactions and the first one must confirm before the second is built.
+    SelfFunded,
+    /// A third party signs as fee payer alongside the authority, in the same
+    /// transaction. No advance, no nonce race, no stranded dust at the deposit
+    /// address — and no partial state if the sweep fails.
+    FeePayer,
+    /// Fees come out of the inputs being spent. Nothing to fund.
+    InputFunded,
+}
+
 #[async_trait]
 pub trait NetworkClient: Send + Sync {
     /// Canonical family string. Must equal one of the constants in
@@ -239,17 +253,41 @@ pub trait NetworkClient: Send + Sync {
     /// "mainnet", "testnet4". A String, not an enum or an integer, precisely
     /// so an EVM chain id and a Solana cluster name share one column.
     fn chain_ref(&self) -> String;
+    fn gas_model(&self) -> GasModel;
 
-    /// Pure key derivation — no I/O. Used both at signup and during backfill.
-    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String>;
+    /// The scheme this family derives under. Asserted against the DB at boot.
+    fn derivation_scheme(&self) -> DerivationScheme;
 
-    async fn get_derive_address(
+    /// Named wallets every merchant needs on this family. Default is the main
+    /// wallet only — UTXO chains pay fees from the inputs they spend and have
+    /// no feeder. EVM and Solana override to add one.
+    fn required_wallets(&self) -> &'static [WalletSpec] {
+        &[MAIN_WALLET]
+    }
+
+    /// Canonical storage form. EVM lowercases; Solana and Bitcoin must not.
+    /// Replaces the `if network_type == "evm"` check that was living at the
+    /// registration call site.
+    fn canonicalize_address(&self, address: &str) -> String {
+        address.to_string()
+    }
+
+    /// Pure, no I/O. The single derivation entry point — every wallet on every
+    /// network, deposit or operational, comes out of here. Returns an already
+    /// canonicalized address.
+    fn derive(&self, mnemonic: &str, role: KeyRole, index: u32)
+              -> Result<DerivedAddress, String>;
+
+    /// Allocates the next deposit index and returns the full derived record,
+    /// including the on-chain reference for this invoice.
+    async fn next_deposit_address(
         &self,
         pool: &PgPool,
         merchant_id: Uuid,
         invoice_id: Uuid,
         mnemonic: &str,
-    ) -> Result<(String, u32, Option<String>), String>;
+    ) -> Result<DerivedAddress, String>;
+
     fn validate_address(&self, address: &str) -> bool;
     async fn get_native_balance(&self, address: &str) -> Result<Amount, String>;
     async fn get_token_balance(
@@ -337,16 +375,4 @@ async fn enqueue_webhook(
         .map_err(|e| format!("enqueue_webhook insert: {e}"))?;
 
     Ok(())
-}
-
-pub fn decrypt_data(master_key: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if nonce_bytes.len() != 12 {
-        return Err("Invalid nonce length".to_string());
-    }
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| "Decryption failed (tampered data or wrong key)".to_string())
 }

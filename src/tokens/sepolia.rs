@@ -10,7 +10,7 @@ use crate::assets::{AssetKey, AssetSpec, NETWORK_EVM};
 use crate::networks::evm::EVMNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView};
-use crate::tokens::crypto::load_merchant_mnemonic;
+use crate::keys::store::load_merchant_seed;
 use crate::tokens::evm_common::{evm_checkout_data, TokenConfig};
 use crate::tokens::handler::{TokenDescriptor, TokenHandler};
 use crate::tokens::invoicer::{Invoicer, PaymentDetails};
@@ -155,11 +155,11 @@ impl Invoicer for SepoliaHandler {
         _amount: rust_decimal::Decimal,
         _token_id: &str,
     ) -> Result<PaymentDetails, String> {
-        let merchant_mnemonic = load_merchant_mnemonic(pool, merchant_id).await?;
+        let merchant_mnemonic = load_merchant_seed(pool, merchant_id).await?;
 
-        let (deposit_address, derived_wallet_index, payment_reference) = self
+        let derived = self
             .network
-            .get_derive_address(pool, merchant_id, invoice_id, &merchant_mnemonic)
+            .next_deposit_address(pool, merchant_id, invoice_id, &merchant_mnemonic)
             .await
             .map_err(|e| format!("Address derivation failed: {e}"))?;
 
@@ -176,19 +176,16 @@ impl Invoicer for SepoliaHandler {
         sqlx::query!(
             r#"
             UPDATE invoices
-            SET wallet_address = $1,
-                wallet_index = $2,
-                expires_at = $3,
-                payment_reference = $4,
-                required_confirmations = $5,
-                created_block = $6,
+            SET wallet_address = $1, wallet_index = $2, wallet_role = $3,
+                wallet_path = $4, scheme_version = $5,
+                expires_at = $6, payment_reference = $7,
+                required_confirmations = $8, created_block = $9,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $7
+            WHERE id = $10
             "#,
-            deposit_address,
-            derived_wallet_index as i32,
-            expires_at,
-            payment_reference,
+            derived.address, derived.index as i32, derived.role.as_i16(),
+            derived.path, derived.scheme_version,
+            expires_at, derived.reference,
             self.config.required_confirmations as i16,
             (created_block - 2).max(0),
             invoice_id
@@ -200,11 +197,11 @@ impl Invoicer for SepoliaHandler {
         Ok(PaymentDetails {
             invoice_id,
             network: self.descriptor.chain.clone(),
-            deposit_address,
+            deposit_address: derived.address,
             token_address: self.descriptor.asset.key.address.clone(),
             decimals: self.descriptor.asset.decimals,
             required_confirmations: self.config.required_confirmations,
-            wallet_index: derived_wallet_index,
+            wallet_index: derived.index,
             expires_at,
         })
     }

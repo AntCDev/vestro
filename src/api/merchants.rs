@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::networks::evm::derive_evm_address;
+use crate::keys::crypto::{decrypt_data, encrypt_data};
+use crate::keys::derivation::KeyRole;
+use crate::keys::wallets::provision_merchant_wallets;
 
 #[derive(Deserialize)]
 pub struct SignUpMerchantRequest {
@@ -51,35 +53,6 @@ fn hash_api_secret(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     hex::encode(hasher.finalize())
-}
-
-/// AES-256-GCM Authenticated Encryption
-fn encrypt_data(master_key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
-
-    // Generate standard 96-bit (12-byte) nonce
-    let mut nonce_bytes = [0u8; 12];
-    rand::fill(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-
-    let ciphertext = cipher
-        .encrypt(nonce, data)
-        .map_err(|e| format!("Encryption error: {e}"))?;
-
-    Ok((ciphertext, nonce_bytes.to_vec()))
-}
-
-/// AES-256-GCM Authenticated Decryption
-pub fn decrypt_data(master_key: &[u8; 32], ciphertext: &[u8], nonce_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    if nonce_bytes.len() != 12 {
-        return Err("Invalid nonce length".to_string());
-    }
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
-    let nonce = Nonce::from_slice(nonce_bytes);
-
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| "Decryption failed (tampered data or wrong key)".to_string())
 }
 
 /// POST /api/merchants
@@ -123,24 +96,25 @@ pub async fn signup_merchant_handler(
         }
     };
 
-    // 3. Derive one wallet address per *configured* network family
-    let mut derived_wallets: Vec<(&'static str, String)> = Vec::new();
-    for client in state.networks.representative_clients() {
-        let mut address = client
-            .derive_wallet_address(&mnemonic_phrase, 0)
-            .map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to derive {} wallet: {e}", client.network_type()),
-            ))?;
+    // // 3. Derive one wallet address per *configured* network family
+    // let mut derived_wallets: Vec<(&'static str, String)> = Vec::new();
+    // for client in state.networks.representative_clients() {
+    //     let mut address = client
+    //         .derive_wallet_address(&mnemonic_phrase, 0)
+    //         .map_err(|e| (
+    //             StatusCode::INTERNAL_SERVER_ERROR,
+    //             format!("Failed to derive {} wallet: {e}", client.network_type()),
+    //         ))?;
+    //
+    //     // EVM addresses are checksum-cased; store canonically lowercase.
+    //     // Solana/Bitcoin addresses are case-sensitive — never lowercase them.
+    //     if client.network_type() == "evm" {
+    //         address = address.to_lowercase();
+    //     }
+    //
+    //     derived_wallets.push((client.network_type(), address));
+    // }
 
-        // EVM addresses are checksum-cased; store canonically lowercase.
-        // Solana/Bitcoin addresses are case-sensitive — never lowercase them.
-        if client.network_type() == "evm" {
-            address = address.to_lowercase();
-        }
-
-        derived_wallets.push((client.network_type(), address));
-    }
     // 4. Hash password with Argon2id & API Secret with SHA-256
     let password_hash = hash_password(&payload.password)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -208,34 +182,50 @@ pub async fn signup_merchant_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed key material insertion: {e}")))?;
 
     // Insert one wallet + one network-index row per configured family
-    for (network_type, address) in &derived_wallets {
-        sqlx::query!(
-            r#"
-            INSERT INTO merchant_wallets (merchant_id, network_type, address)
-            VALUES ($1, $2, $3)
-            "#,
-            merchant_id,
-            network_type,
-            address
-        )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed {network_type} wallet insertion: {e}")))?;
+    // for (network_type, address) in &derived_wallets {
+    //     sqlx::query!(
+    //         r#"
+    //         INSERT INTO merchant_wallets (merchant_id, network_type, address)
+    //         VALUES ($1, $2, $3)
+    //         "#,
+    //         merchant_id,
+    //         network_type,
+    //         address
+    //     )
+    //         .execute(&mut *tx)
+    //         .await
+    //         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed {network_type} wallet insertion: {e}")))?;
+    //
+    //     sqlx::query!(
+    //         r#"
+    //         INSERT INTO merchant_network_indices (
+    //             merchant_id, network, account_index, next_index
+    //         )
+    //         VALUES ($1, $2, 0, 0)
+    //         "#,
+    //         merchant_id,
+    //         network_type
+    //     )
+    //         .execute(&mut *tx)
+    //         .await
+    //         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed {network_type} index insertion: {e}")))?;
+    // }
 
-        sqlx::query!(
-            r#"
-            INSERT INTO merchant_network_indices (
-                merchant_id, network, account_index, next_index
-            )
-            VALUES ($1, $2, 0, 0)
-            "#,
-            merchant_id,
-            network_type
-        )
-            .execute(&mut *tx)
+    let mut derived_wallets: Vec<(&'static str, String)> = Vec::new();
+    for client in state.networks.representative_clients() {
+        let wallets = provision_merchant_wallets(&mut tx, client.as_ref(), merchant_id, &mnemonic_phrase)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed {network_type} index insertion: {e}")))?;
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to provision {} wallets: {e}", client.network_type()),
+            ))?;
+
+        // The main wallet is what the API returns; the feeder is internal.
+        if let Some(main) = wallets.iter().find(|w| w.role == KeyRole::Deposit && w.index == 0) {
+            derived_wallets.push((client.network_type(), main.address.clone()));
+        }
     }
+
 
     tx.commit().await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("Transaction commit failed: {e}"))

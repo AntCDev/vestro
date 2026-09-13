@@ -1,4 +1,4 @@
-use super::{enqueue_webhook, Amount, NetworkClient, PaymentWatch, decrypt_data};
+use super::{enqueue_webhook, Amount, NetworkClient, PaymentWatch, decrypt_data, GasModel};
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -18,6 +18,9 @@ use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
 
 use chrono::{DateTime, Utc};
+use crate::keys::derivation::{DerivationScheme, DerivedAddress, KeyRole, WalletSpec, GAS_FEEDER_WALLET, MAIN_WALLET, SCHEME_VERSION};
+use crate::keys::store::assert_scheme;
+use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets};
 use crate::ledgerer::{
     AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
     ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
@@ -175,6 +178,11 @@ pub const DEFAULT_VAULT_PAY_ABI: &str =
 pub const DEFAULT_VAULT_PAY_NATIVE_ABI: &str =
     "function payNative(bytes16 identifier, address merchant) payable";
 
+pub const EVM_COIN_TYPE: u32 = 60;
+pub const EVM_TEMPLATE: &str = "m/44'/{coin}'/{role}'/{index}'";
+
+const EVM_REQUIRED_WALLETS: &[WalletSpec] = &[MAIN_WALLET, GAS_FEEDER_WALLET];
+
 fn address_to_topic(addr_lc: &str) -> String {
     format!("0x{:0>64}", addr_lc.trim_start_matches("0x"))
 }
@@ -312,38 +320,42 @@ fn decode_payment_log(log: &Log) -> Result<PaymentEvent, String> {
 
     Ok(PaymentEvent { invoice_id, merchant_lc, token_lc, payer_lc, amount_requested, amount_received })
 }
+pub fn evm_scheme() -> DerivationScheme {
+    DerivationScheme {
+        network_type: crate::assets::NETWORK_EVM,
+        coin_type: EVM_COIN_TYPE,
+        template: EVM_TEMPLATE,
+        version: SCHEME_VERSION,
+    }
+}
 
-pub fn derive_evm_address(mnemonic: &str, index: u32) -> Result<String, String> {
-    let mnemonic_parsed = Mnemonic::parse(mnemonic)
-        .map_err(|e| format!("Invalid mnemonic: {}", e))?;
+/// Address and signing key from one derivation, so a feeder can never sign
+/// with a key that doesn't match the address it believes it holds.
+/// `derive_evm_address` is now a thin wrapper over this — there is exactly one
+/// path from mnemonic to address in the codebase.
+pub fn derive_evm_keypair(
+    mnemonic: &str,
+    role: KeyRole,
+    index: u32,
+) -> Result<(k256::ecdsa::SigningKey, String), String> {
+    let scheme = evm_scheme();
+    let seed = scheme.seed(mnemonic)?;
+    let path = scheme.path(role, index)?;
 
-    let seed = mnemonic_parsed.to_seed("");
+    let xprv = XPrv::derive_from_path(&seed, &path)
+        .map_err(|e| format!("Failed to derive at {}: {e}", scheme.path_string(role, index)))?;
 
-    let path_str = get_derivation_path(index);
-    let path: DerivationPath = path_str
-        .parse()
-        .map_err(|e| format!("Failed to parse derivation path: {}", e))?;
-
-    let child_xprv = XPrv::derive_from_path(&seed, &path)
-        .map_err(|e| format!("Failed to derive child key at path: {}", e))?;
-
-    let secret_key = child_xprv.private_key();
-    let public_key = secret_key.public_key();
-
-    let public_key_point = public_key.to_encoded_point(false);
-    let point_bytes = public_key_point.as_bytes();
+    let secret = xprv.private_key();
+    let point = secret.public_key().to_encoded_point(false);
 
     let mut hasher = Keccak256::new();
-    hasher.update(&point_bytes[1..]);
-    let hash_result = hasher.finalize();
+    hasher.update(&point.as_bytes()[1..]);
+    let hash = hasher.finalize();
+    let address = format!("0x{}", hex::encode(&hash[12..]));
 
-    let address_bytes = &hash_result[12..];
+    Ok((secret.clone(), address))
+}
 
-    Ok(format!("0x{}", hex::encode(address_bytes)))
-}
-fn get_derivation_path(index: u32) -> String {
-    format!("m/44'/60'/0'/0/{index}")
-}
 
 fn hex_to_u64(hex_str: &str) -> u64 {
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).unwrap_or(0)
@@ -451,25 +463,38 @@ impl EVMNetwork {
         self.contract_address.as_deref()
     }
 
-    pub async fn merchant_wallet(
+    fn derivation_scheme(&self) -> DerivationScheme { evm_scheme() }
+
+    fn canonicalize_address(&self, address: &str) -> String { address.to_lowercase() }
+    async fn next_deposit_address(
         &self,
         pool: &PgPool,
         merchant_id: Uuid,
-    ) -> Result<String, String> {
-        sqlx::query_scalar!(
+        invoice_id: Uuid,
+        mnemonic: &str,
+    ) -> Result<DerivedAddress, String> {
+        // next_index holds the highest index allocated. Seeding at 1 on insert
+        // means index 0 is permanently reserved for the main wallet.
+        let row = sqlx::query!(
             r#"
-            SELECT address
-            FROM merchant_wallets
-            WHERE merchant_id = $1 AND network_type = 'evm'
+            INSERT INTO merchant_network_indices (merchant_id, network, role, next_index)
+            VALUES ($1, $2, $3, 1)
+            ON CONFLICT (merchant_id, network, role)
+            DO UPDATE SET
+                next_index = merchant_network_indices.next_index + 1,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING next_index
             "#,
-            merchant_id
+            merchant_id,
+            self.network_name,
+            KeyRole::Deposit.as_i16()
         )
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("Failed to look up EVM merchant wallet: {e}"))?
-            .ok_or_else(|| {
-                format!("No EVM wallet provisioned for merchant {merchant_id}")
-            })
+            .fetch_one(pool).await
+            .map_err(|e| format!("Failed to allocate deposit index: {e}"))?;
+
+        let mut derived = self.derive(mnemonic, KeyRole::Deposit, row.next_index as u32)?;
+        derived.reference = Some(format!("0x{}", hex::encode(invoice_id.as_bytes())));
+        Ok(derived)
     }
 
     pub fn vault_pay_abi(&self) -> String {
@@ -2649,68 +2674,15 @@ impl EVMNetwork {
         Ok(())
     }
 
-    async fn ensure_merchant_wallets(&self, pool: &PgPool) -> Result<(), String> {
-        let master_key_hex = std::env::var("MASTER_KEY")
-            .map_err(|_| "MASTER_KEY environment variable not set".to_string())?;
-
-        let master_key_vec = hex::decode(&master_key_hex)
-            .map_err(|_| "MASTER_KEY must be a valid hex string".to_string())?;
-
-        let master_key: &[u8; 32] = master_key_vec
-            .as_slice()
-            .try_into()
-            .map_err(|_| "MASTER_KEY must be exactly 32 bytes".to_string())?;
-
-        // Find merchants missing an EVM wallet record
-        let uninitialized_merchants = sqlx::query!(
-            r#"
-            SELECT m.id, km.encrypted_secret, km.encryption_nonce
-            FROM merchants m
-            JOIN merchant_key_material km ON m.id = km.merchant_id
-            WHERE km.key_family = 'bip39'
-              AND NOT EXISTS (
-                  SELECT 1 FROM merchant_wallets mw
-                  WHERE mw.merchant_id = m.id AND mw.network_type = 'evm'
-              )
-            "#
-        )
-            .fetch_all(pool)
-            .await
-            .map_err(|e| format!("Failed to query merchants missing EVM wallets: {e}"))?;
-
-        for record in uninitialized_merchants {
-            let decrypted_mnemonic_bytes = decrypt_data(master_key, &record.encrypted_secret, &record.encryption_nonce)
-                .map_err(|e| format!("Failed to decrypt mnemonic for merchant {}: {e}", record.id))?;
-
-            let mnemonic_phrase = String::from_utf8(decrypted_mnemonic_bytes)
-                .map_err(|e| format!("Invalid UTF-8 mnemonic for merchant {}: {e}", record.id))?;
-
-            // Derive index 0 for the merchant wallet
-            let evm_address = derive_evm_address(&mnemonic_phrase, 0)
-                .map_err(|e| format!("Failed to derive EVM wallet for merchant {}: {e}", record.id))?;
-
-            sqlx::query!(
-                r#"
-                INSERT INTO merchant_wallets (merchant_id, network_type, address)
-                VALUES ($1, 'evm', $2)
-                ON CONFLICT (merchant_id, network_type) DO NOTHING
-                "#,
-                record.id,
-                evm_address.to_lowercase()
-            )
-                .execute(pool)
-                .await
-                .map_err(|e| format!("Failed to save derived EVM wallet for merchant {}: {e}", record.id))?;
-
-            println!("Initialized EVM wallet ({}) for merchant {}", evm_address, record.id);
-        }
-
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl NetworkClient for EVMNetwork {
+    fn derivation_scheme(&self) -> DerivationScheme { evm_scheme() }
+    fn required_wallets(&self) -> &'static [WalletSpec] { EVM_REQUIRED_WALLETS }
+
+    fn canonicalize_address(&self, address: &str) -> String { address.to_lowercase() }
+
     fn network_type(&self) -> &'static str {
         crate::assets::NETWORK_EVM
     }
@@ -2718,40 +2690,34 @@ impl NetworkClient for EVMNetwork {
     fn chain_ref(&self) -> String {
         self.chain_id.to_string()
     }
-    async fn get_derive_address(
+    fn gas_model(&self) -> GasModel { GasModel::SelfFunded }
+    fn derive(&self, mnemonic: &str, role: KeyRole, index: u32)
+              -> Result<DerivedAddress, String>
+    {
+        let scheme = evm_scheme();
+        let (_key, address) = derive_evm_keypair(mnemonic, role, index)?;
+        Ok(DerivedAddress {
+            address: self.canonicalize_address(&address),
+            role,
+            index,
+            path: scheme.path_string(role, index),
+            scheme_version: scheme.version,
+            reference: None,
+        })
+    }
+
+    async fn next_deposit_address(
         &self,
         pool: &PgPool,
         merchant_id: Uuid,
         invoice_id: Uuid,
         mnemonic: &str,
-    ) -> Result<(String, u32, Option<String>), String> {
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO merchant_network_indices (merchant_id, network, account_index, next_index)
-            VALUES ($1, $2, 0, 1)
-            ON CONFLICT (merchant_id, network, account_index)
-            DO UPDATE SET
-                next_index = merchant_network_indices.next_index + 1,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING next_index
-            "#,
-            merchant_id,
-            self.network_name
-        )
-            .fetch_one(pool)
-            .await
-            .map_err(|e| format!("Failed to update merchant network index: {e}"))?;
-
-        let index = row.next_index as u32;
-        let address = derive_evm_address(mnemonic, index)?;
-
-        let reference = format!("0x{}", hex::encode(invoice_id.as_bytes()));
-
-        Ok((address, index, Some(reference)))
-    }
-
-    fn derive_wallet_address(&self, mnemonic: &str, index: u32) -> Result<String, String> {
-        derive_evm_address(mnemonic, index)
+    ) -> Result<DerivedAddress, String> {
+        let index =
+            allocate_deposit_index(pool, merchant_id, self.network_type()).await?;
+        let mut derived = self.derive(mnemonic, KeyRole::Deposit, index)?;
+        derived.reference = Some(format!("0x{}", hex::encode(invoice_id.as_bytes())));
+        Ok(derived)
     }
 
     fn validate_address(&self, address: &str) -> bool {
@@ -2790,23 +2756,19 @@ impl NetworkClient for EVMNetwork {
     // --- BATCHED WATCHING METHODS ---
 
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
-        println!(
-            "EVMNetwork::spin_up initializing for {} ({})",
-            self.network_name, self.chain_id
-        );
+        println!("EVMNetwork::spin_up initializing for {} ({})",
+                 self.network_name, self.chain_id);
 
-        // 1. Backfill missing EVM addresses for all merchants at index 0
-        self.ensure_merchant_wallets(pool).await?;
+        // 0. Code and DB must agree on the scheme before anything derives.
+        assert_scheme(pool, &self.derivation_scheme()).await?;
 
-        // 2. Start watcher sub-services concurrently
-        let (addresses_res, logs_res) = tokio::join!(
-            self.watch_addresses(pool),
-            self.watch_logs(pool)
-        );
+        // 1. Main wallet + gas feeder for every merchant missing either.
+        ensure_merchant_wallets(pool, self).await?;
 
+        let (addresses_res, logs_res) =
+            tokio::join!(self.watch_addresses(pool), self.watch_logs(pool));
         addresses_res?;
         logs_res?;
-
         Ok(())
     }
 }

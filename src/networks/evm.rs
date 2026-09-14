@@ -12,6 +12,7 @@ use sqlx::{Postgres, Row, Transaction};
 use bip32::{DerivationPath, PrivateKey, XPrv};
 use bip39::Mnemonic;
 use sha2::Sha256;
+use k256::ecdsa::SigningKey;
 use sha3::{Digest, Keccak256};
 use sqlx::PgPool;
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +26,7 @@ use crate::ledgerer::{
     AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
     ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
 };
+use crate::networks::transfers::{SignedTransfer, TransferAmount, TransferRequest, TransferStatus};
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -2702,6 +2704,28 @@ impl EVMNetwork {
         Ok(())
     }
 
+    async fn fee_params(&self) -> Result<(u128, u128), String> {
+        let block = self.call_rpc_json("eth_getBlockByNumber", json!(["latest", false])).await?;
+        let base = block["baseFeePerGas"].as_str()
+            .map(|h| hex_to_u128(h.trim_start_matches("0x")).unwrap_or(0))
+            .unwrap_or(0);
+        let priority = match self.call_rpc("eth_maxPriorityFeePerGas", json!([])).await {
+            Ok(h) => hex_to_u128(h.trim_start_matches("0x")).unwrap_or(1_000_000_000),
+            Err(_) => 1_000_000_000, // 1 gwei; pre-London / stingy providers
+        };
+        Ok((priority, base * 2 + priority))
+    }
+
+    async fn estimate_gas(&self, from: &str, to: &str, value: u128, data: &[u8]) -> Result<u64, String> {
+        let h = self.call_rpc("eth_estimateGas", json!([{
+            "from": from, "to": to,
+            "value": format!("0x{value:x}"),
+            "data": format!("0x{}", hex::encode(data)),
+        }])).await?;
+        let g = u64::from_str_radix(h.trim_start_matches("0x"), 16).map_err(|e| e.to_string())?;
+        Ok(g + g / 5) // 20% headroom
+    }
+
 }
 
 #[async_trait]
@@ -2781,6 +2805,119 @@ impl NetworkClient for EVMNetwork {
             .map_err(|_| "Failed to parse hex block number".to_string())
     }
 
+    async fn build_and_sign(&self, pool: &PgPool, mnemonic: &str, req: &TransferRequest)
+                            -> Result<SignedTransfer, String>
+    {
+        if req.fee_payer.is_some() {
+            return Err("EVM is SelfFunded: fee_payer must be None".into());
+        }
+        let (key, derived_addr) = derive_evm_keypair(mnemonic, req.from.authority.role, req.from.authority.index)?;
+        if derived_addr.to_lowercase() != req.from.address.to_lowercase() {
+            return Err(format!(
+                "authority {} derives {} but from_address is {} — refusing to sign",
+                req.from.authority.to_ref(), derived_addr, req.from.address));
+        }
+        let from = &req.from.address;
+        let to20 = parse_address(&req.to)?;
+        let (priority, max_fee) = self.fee_params().await?;
+
+        let (tx_to, value, data, amount) = match &req.asset.address {
+            None => {
+                // Native. Gas for a plain send is fixed; estimate anyway in case `to` is a contract.
+                let gas = self.estimate_gas(from, &req.to, 1, &[]).await?;
+                let amount = match req.amount {
+                    TransferAmount::Exact(n) => n,
+                    TransferAmount::Max => {
+                        let bal = self.get_native_balance(from).await?.0;
+                        let reserve = gas as u128 * max_fee;
+                        bal.checked_sub(reserve)
+                            .ok_or_else(|| format!("{from}: balance {bal} < gas reserve {reserve}"))?
+                    }
+                };
+                (to20, amount, Vec::new(), amount)
+            }
+            Some(token) => {
+                let amount = match req.amount {
+                    TransferAmount::Exact(n) => n,
+                    TransferAmount::Max => self.get_token_balance(token, from, 0).await?.0,
+                };
+                if amount == 0 { return Err(format!("{from}: nothing to sweep for {token}")); }
+                (parse_address(token)?, 0, erc20_transfer_calldata(&to20, amount), amount)
+            }
+        };
+
+        let gas_limit = self.estimate_gas(
+            from, &format!("0x{}", hex::encode(tx_to)), value, &data).await?;
+
+        // Gas must be there NOW. If not, fail before touching the nonce counter.
+        let native = self.get_native_balance(from).await?.0;
+        let needed = value + gas_limit as u128 * max_fee;
+        if native < needed {
+            return Err(format!("{from}: has {native} wei, needs {needed} (gas refill required)"));
+        }
+
+        let nonce = self.allocate_nonce(pool, from).await?;
+        let tx = Eip1559Tx {
+            chain_id: self.chain_id, nonce, max_priority_fee: priority, max_fee,
+            gas_limit, to: tx_to, value, data,
+        };
+        let (raw, tx_hash) = tx.sign(&key)?;
+
+        Ok(SignedTransfer {
+            tx_hash, raw, amount,
+            from: from.clone(),
+            valid_until: None,
+            nonce: Some(nonce),
+            fee_estimate: Some(gas_limit as u128 * max_fee),
+        })
+    }
+
+    async fn broadcast(&self, signed: &SignedTransfer) -> Result<(), String> {
+        let raw = format!("0x{}", hex::encode(&signed.raw));
+        match self.call_rpc_fallback("eth_sendRawTransaction", json!([raw])).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let l = e.to_lowercase();
+                // Idempotent: node already has it, or it already mined.
+                if l.contains("already known") || l.contains("known transaction")
+                    || l.contains("nonce too low") || l.contains("already imported") {
+                    Ok(())
+                } else { Err(e) }
+            }
+        }
+    }
+
+    async fn transfer_status(&self, signed: &SignedTransfer) -> Result<TransferStatus, String> {
+        let receipt = self.call_rpc_fallback("eth_getTransactionReceipt", json!([signed.tx_hash])).await?;
+        if !receipt.is_null() {
+            let block = hex_to_u64(receipt["blockNumber"].as_str().ok_or("receipt: no blockNumber")?);
+            let gas_used = hex_to_u128(receipt["gasUsed"].as_str().unwrap_or("0x0").trim_start_matches("0x")).unwrap_or(0);
+            let price = hex_to_u128(receipt["effectiveGasPrice"].as_str().unwrap_or("0x0").trim_start_matches("0x")).unwrap_or(0);
+            let fee_paid = gas_used * price;
+            return Ok(match receipt["status"].as_str() {
+                Some("0x1") => TransferStatus::Confirmed { block, fee_paid },
+                _ => TransferStatus::Failed { reason: format!("reverted in block {block}") },
+            });
+        }
+
+        // No receipt. In the mempool?
+        let tx = self.call_rpc_fallback("eth_getTransactionByHash", json!([signed.tx_hash])).await?;
+        if !tx.is_null() { return Ok(TransferStatus::Pending); }
+
+        // Not in the mempool. Only expired if the nonce was spent by something else.
+        if let Some(nonce) = signed.nonce {
+            let count = self.call_rpc_fallback(
+                "eth_getTransactionCount",
+                json!([signed.from, "latest"]),
+            ).await?;
+            let count = u64::from_str_radix(
+                count.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16,
+            ).unwrap_or(0);
+            if count > nonce { return Ok(TransferStatus::Expired); }
+        }
+        Ok(TransferStatus::Unknown)
+    }
+
     // --- BATCHED WATCHING METHODS ---
 
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
@@ -2799,4 +2936,104 @@ impl NetworkClient for EVMNetwork {
         logs_res?;
         Ok(())
     }
+}
+
+
+fn rlp_bytes(b: &[u8], out: &mut Vec<u8>) {
+    match b.len() {
+        1 if b[0] < 0x80 => out.push(b[0]),
+        n if n < 56 => { out.push(0x80 + n as u8); out.extend_from_slice(b); }
+        n => {
+            let len = n.to_be_bytes();
+            let len = &len[len.iter().position(|&x| x != 0).unwrap()..];
+            out.push(0xb7 + len.len() as u8);
+            out.extend_from_slice(len);
+            out.extend_from_slice(b);
+        }
+    }
+}
+
+fn rlp_uint(v: u128, out: &mut Vec<u8>) {
+    if v == 0 { out.push(0x80); return; }
+    let be = v.to_be_bytes();
+    rlp_bytes(&be[be.iter().position(|&x| x != 0).unwrap()..], out);
+}
+
+fn rlp_list(payload: &[u8], out: &mut Vec<u8>) {
+    match payload.len() {
+        n if n < 56 => out.push(0xc0 + n as u8),
+        n => {
+            let len = n.to_be_bytes();
+            let len = &len[len.iter().position(|&x| x != 0).unwrap()..];
+            out.push(0xf7 + len.len() as u8);
+            out.extend_from_slice(len);
+        }
+    }
+    out.extend_from_slice(payload);
+}
+
+pub struct Eip1559Tx {
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub max_priority_fee: u128,
+    pub max_fee: u128,
+    pub gas_limit: u64,
+    pub to: [u8; 20],
+    pub value: u128,
+    pub data: Vec<u8>,
+}
+
+impl Eip1559Tx {
+    fn fields(&self, out: &mut Vec<u8>) {
+        rlp_uint(self.chain_id as u128, out);
+        rlp_uint(self.nonce as u128, out);
+        rlp_uint(self.max_priority_fee, out);
+        rlp_uint(self.max_fee, out);
+        rlp_uint(self.gas_limit as u128, out);
+        rlp_bytes(&self.to, out);
+        rlp_uint(self.value, out);
+        rlp_bytes(&self.data, out);
+        rlp_list(&[], out); // access list
+    }
+
+    /// Returns (raw_signed_tx, tx_hash_hex).
+    pub fn sign(&self, key: &SigningKey) -> Result<(Vec<u8>, String), String> {
+        let mut payload = Vec::new();
+        self.fields(&mut payload);
+        let mut unsigned = vec![0x02];
+        rlp_list(&payload, &mut unsigned);
+        let sighash = Keccak256::digest(&unsigned);
+
+        let (sig, rec) = key
+            .sign_prehash_recoverable(&sighash)
+            .map_err(|e| format!("secp256k1 sign: {e}"))?;
+        let r = sig.r().to_bytes();
+        let s = sig.s().to_bytes();
+
+        rlp_uint(rec.to_byte() as u128, &mut payload);
+        rlp_bytes(strip(&r), &mut payload);
+        rlp_bytes(strip(&s), &mut payload);
+
+        let mut raw = vec![0x02];
+        rlp_list(&payload, &mut raw);
+        let hash = format!("0x{}", hex::encode(Keccak256::digest(&raw)));
+        Ok((raw, hash))
+    }
+}
+
+fn strip(b: &[u8]) -> &[u8] {
+    match b.iter().position(|&x| x != 0) { Some(i) => &b[i..], None => &[] }
+}
+
+pub fn parse_address(s: &str) -> Result<[u8; 20], String> {
+    let b = hex::decode(s.trim_start_matches("0x")).map_err(|e| format!("address {s}: {e}"))?;
+    b.try_into().map_err(|_| format!("address {s}: not 20 bytes"))
+}
+
+/// transfer(address,uint256)
+pub fn erc20_transfer_calldata(to: &[u8; 20], amount: u128) -> Vec<u8> {
+    let mut d = vec![0xa9, 0x05, 0x9c, 0xbb];
+    d.extend_from_slice(&[0u8; 12]); d.extend_from_slice(to);
+    d.extend_from_slice(&[0u8; 16]); d.extend_from_slice(&amount.to_be_bytes());
+    d
 }

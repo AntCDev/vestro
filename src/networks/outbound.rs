@@ -7,17 +7,17 @@
 //!
 //! Only `expired` may produce a new signature.
 //!
-//! SQL policy for this module: every statement is a `&'static str` literal (or
-//! a `concat!` of literals, resolved at compile time). Nothing is built with
-//! `format!` at runtime, and every value — including the lease interval —
-//! arrives as a bound parameter. That means there is no code path where a
-//! value can be parsed as SQL.
+//! SQL policy for this module: every statement goes through `sqlx::query!` /
+//! `query_as!`, which only accept a string literal and check it against the
+//! live schema at compile time. There is no runtime string building, so no
+//! value can reach the parser as SQL. Requires `DATABASE_URL` at build time,
+//! or a checked-in `.sqlx/` from `cargo sqlx prepare` for CI.
 
 use std::sync::Arc;
 use std::time::Duration;
 use rust_decimal::Decimal;
 use serde_json::Value;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::keys::derivation::KeyRole;
@@ -26,7 +26,8 @@ use crate::ledgerer::{AddressKind, AssetKey, AssetKind, ChainRef, Ledgerer, Outb
 use crate::networks::transfers::*;
 use crate::networks::NetworkClient;
 
-/// Claim lease. Bound as a parameter and cast server-side, never interpolated.
+/// Claim lease. Bound as a parameter and parsed server-side; never spliced
+/// into the statement text.
 const LEASE: &str = "5 minutes";
 
 pub fn spawn(pool: PgPool, net: Arc<dyn NetworkClient>) {
@@ -53,16 +54,29 @@ async fn tick(pool: &PgPool, net: &dyn NetworkClient, ledger: &Ledgerer) -> Resu
         let signed = row.signed()?;
         match net.broadcast(&signed).await {
             Ok(()) => {
-                sqlx::query(MARK_BROADCAST)
-                    .bind(row.id)
+                sqlx::query!(
+                    r#"
+                    UPDATE outbound_transfers
+                       SET status = 'broadcast', claimed_at = NULL, updated_at = now()
+                     WHERE id = $1
+                    "#,
+                    row.id,
+                )
                     .execute(pool)
                     .await
-                    .map_err(|e| e.to_string())?;
-                sqlx::query(SWEEP_MARK_BROADCAST)
-                    .bind(row.id)
+                    .map_err(|e| format!("mark broadcast: {e}"))?;
+
+                sqlx::query!(
+                    r#"
+                    UPDATE sweep_queue
+                       SET status = 'broadcast'
+                     WHERE transfer_id = $1 AND status = 'claimed'
+                    "#,
+                    row.id,
+                )
                     .execute(pool)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format!("sweep mark broadcast: {e}"))?;
             }
             Err(e) => fail_soft(pool, row.id, &e).await?,
         }
@@ -102,227 +116,228 @@ impl TransferRow {
         Ok(SignedTransfer {
             tx_hash: self.tx_hash.clone().ok_or("row has no tx_hash")?,
             raw: self.raw.clone().ok_or("row has no raw_tx")?,
+            from: self.req.from.address.clone(),
             amount: self.amount_resolved.as_deref().ok_or("row has no amount_resolved")?
                 .parse().map_err(|e| format!("amount_resolved: {e}"))?,
             valid_until: self.valid_until.map(|v| v as u64),
-            nonce: self.nonce.map(|v| v as u64),
+            nonce: self.nonce.map(|v| v as i64 as u64),
             fee_estimate: self.fee_estimate.as_deref().and_then(|s| s.parse().ok()),
         })
     }
 }
 
-// ─── statements ────────────────────────────────────────────────────────────
-//
-// The shared column list lives in a `macro_rules!` rather than a `const` so
-// that `concat!` can splice it into complete statements at compile time.
-// `concat!` only accepts literals, which is exactly the property we want: the
-// full statement text is fixed before the binary is built.
-
-macro_rules! select_base {
-    () => {
-        r#"
-    SELECT t.id, t.merchant_id, t.asset_id, t.token_id, t.intent,
-           t.network_type, t.chain_ref, t.from_address, t.from_kind,
-           t.authority_role, t.authority_index, t.fee_payer_role, t.fee_payer_index,
-           t.to_address, t.amount_requested::text AS amount_requested,
-           t.amount_resolved::text AS amount_resolved, t.params,
-           t.tx_hash, t.raw_tx, t.nonce, t.valid_until, t.fee_estimate::text AS fee_estimate,
-           a.asset_kind, a.address AS asset_address
-      FROM outbound_transfers t JOIN assets a ON a.id = t.asset_id
-"#
-    };
+/// Flat mirror of the `outbound_transfers ⋈ assets` projection. `query_as!`
+/// fills this **by position**, so the field order here must match the SELECT
+/// list in `fetch_by_id` and `load` exactly. Changing either without the
+/// other is a compile error, which is the point.
+struct TransferDbRow {
+    id: Uuid,
+    merchant_id: Uuid,
+    asset_id: Uuid,
+    token_id: Option<String>,
+    intent: String,
+    network_type: String,
+    chain_ref: String,
+    from_address: String,
+    from_kind: String,
+    authority_role: i16,
+    authority_index: i32,
+    fee_payer_role: Option<i16>,
+    fee_payer_index: Option<i32>,
+    to_address: String,
+    amount_requested: Option<String>,
+    amount_resolved: Option<String>,
+    params: Value,
+    tx_hash: Option<String>,
+    raw_tx: Option<Vec<u8>>,
+    nonce: Option<i64>,
+    valid_until: Option<i64>,
+    fee_estimate: Option<String>,
+    asset_kind: String,
+    asset_address: Option<String>,
 }
 
-const SELECT_BY_ID: &str = concat!(select_base!(), "\n     WHERE t.id = $1");
+impl TryFrom<TransferDbRow> for TransferRow {
+    type Error = String;
 
-const SELECT_BY_CHAIN_STATUS: &str = concat!(
-select_base!(),
-"\n     WHERE t.network_type = $1 AND t.chain_ref = $2 AND t.status = $3\n     ORDER BY t.created_at"
-);
+    fn try_from(r: TransferDbRow) -> Result<Self, Self::Error> {
+        let chain = ChainRef::new(r.network_type, r.chain_ref);
+        let asset = match r.asset_kind.as_str() {
+            "native" => AssetKey::native(chain),
+            _ => AssetKey::contract_canonical(chain, r.asset_address.unwrap_or_default()),
+        };
+        let signer = |role: Option<i16>, idx: Option<i32>| -> Result<Option<SignerRef>, String> {
+            Ok(match (role, idx) {
+                (Some(role), Some(idx)) => Some(SignerRef {
+                    role: KeyRole::from_i16(role)?,
+                    index: idx as u32,
+                }),
+                _ => None,
+            })
+        };
+        let amount = match r.amount_requested {
+            None => TransferAmount::Max,
+            Some(s) => TransferAmount::Exact(s.parse().map_err(|e| format!("amount_requested: {e}"))?),
+        };
+        // authority_{role,index} are NOT NULL in the schema, so this is always
+        // present; the helper is shared with fee_payer, which really is nullable.
+        let authority = signer(Some(r.authority_role), Some(r.authority_index))?
+            .ok_or("row has no authority signer")?;
 
-/// `$4` is the lease. Cast through `text` so the driver can send it as a plain
-/// string parameter and Postgres does the interval parse — same shape as the
-/// `$n::text::numeric` casts elsewhere in this module.
-const CLAIM: &str = r#"
-    WITH c AS (
-        SELECT id
-          FROM outbound_transfers
-         WHERE network_type = $1
-           AND chain_ref = $2
-           AND status = $3
-           AND (claimed_at IS NULL OR claimed_at < now() - $4::text::interval)
-         ORDER BY created_at
-         LIMIT 1
-         FOR UPDATE SKIP LOCKED
-    )
-    UPDATE outbound_transfers t
-       SET claimed_at = now(), attempts = attempts + 1, updated_at = now()
-      FROM c
-     WHERE t.id = c.id
-    RETURNING t.id
-"#;
-
-const MARK_BROADCAST: &str = r#"
-    UPDATE outbound_transfers
-       SET status = 'broadcast', claimed_at = NULL, updated_at = now()
-     WHERE id = $1
-"#;
-
-const SWEEP_MARK_BROADCAST: &str = r#"
-    UPDATE sweep_queue
-       SET status = 'broadcast'
-     WHERE transfer_id = $1 AND status = 'claimed'
-"#;
-
-const PERSIST_SIGNED: &str = r#"
-    UPDATE outbound_transfers
-       SET status = 'signed', tx_hash = $2, raw_tx = $3,
-           amount_resolved = $4::text::numeric,
-           nonce = $5, valid_until = $6, fee_estimate = $7::text::numeric,
-           claimed_at = NULL, last_error = NULL, updated_at = now()
-     WHERE id = $1 AND status = 'pending'
-"#;
-
-const RECORD_ERROR: &str = r#"
-    UPDATE outbound_transfers
-       SET last_error = $2, claimed_at = NULL, updated_at = now()
-     WHERE id = $1
-"#;
-
-const MARK_TERMINAL: &str = r#"
-    UPDATE outbound_transfers
-       SET status = $2, last_error = $3, claimed_at = NULL, updated_at = now()
-     WHERE id = $1
-"#;
-
-const SWEEP_RELEASE: &str = r#"
-    UPDATE sweep_queue
-       SET status = 'pending', transfer_id = NULL
-     WHERE transfer_id = $1
-"#;
-
-const MARK_EXPIRED: &str = r#"
-    UPDATE outbound_transfers
-       SET status = 'expired', claimed_at = NULL, updated_at = now()
-     WHERE id = $1
-"#;
-
-const CLONE_INTENT: &str = r#"
-    INSERT INTO outbound_transfers
-        (merchant_id, network_type, chain_ref, asset_id, token_id, intent,
-         from_address, from_kind, authority_role, authority_index, fee_payer_role, fee_payer_index,
-         to_address, amount_requested, params, supersedes)
-    SELECT merchant_id, network_type, chain_ref, asset_id, token_id, intent,
-           from_address, from_kind, authority_role, authority_index, fee_payer_role, fee_payer_index,
-           to_address, amount_requested, params, id
-      FROM outbound_transfers
-     WHERE id = $1
-    RETURNING id
-"#;
-
-const SWEEP_REPOINT: &str = r#"
-    UPDATE sweep_queue
-       SET transfer_id = $2, status = 'claimed'
-     WHERE transfer_id = $1
-"#;
-
-const MARK_CONFIRMED: &str = r#"
-    UPDATE outbound_transfers
-       SET status = 'confirmed', block_number = $2, fee_paid = $3::text::numeric,
-           claimed_at = NULL, updated_at = now()
-     WHERE id = $1 AND status = 'broadcast'
-"#;
-
-const SWEEP_MARK_SWEPT: &str = r#"
-    UPDATE sweep_queue
-       SET status = 'swept'
-     WHERE transfer_id = $1
-"#;
-
-// ─── mapping ───────────────────────────────────────────────────────────────
-
-fn from_row(r: sqlx::postgres::PgRow) -> Result<TransferRow, String> {
-    let chain = ChainRef::new(r.get::<String, _>("network_type"), r.get::<String, _>("chain_ref"));
-    let asset = match r.get::<String, _>("asset_kind").as_str() {
-        "native" => AssetKey::native(chain),
-        _ => {
-            let addr = r.get::<Option<String>, _>("asset_address").unwrap_or_default();
-            AssetKey::contract_canonical(chain, addr)
-        }
-    };
-    let signer = |role: Option<i16>, idx: Option<i32>| -> Result<Option<SignerRef>, String> {
-        Ok(match (role, idx) {
-            (Some(r), Some(i)) => Some(SignerRef { role: KeyRole::from_i16(r)?, index: i as u32 }),
-            _ => None,
-        })
-    };
-    let amount = match r.get::<Option<String>, _>("amount_requested") {
-        None => TransferAmount::Max,
-        Some(s) => TransferAmount::Exact(s.parse().map_err(|e| format!("amount_requested: {e}"))?),
-    };
-    let id: Uuid = r.get("id");
-    let merchant_id: Uuid = r.get("merchant_id");
-    let authority = signer(r.get("authority_role"), r.get("authority_index"))?
-        .ok_or("row has no authority signer")?;
-    Ok(TransferRow {
-        id, merchant_id,
-        asset_id: r.get("asset_id"),
-        token_id: r.get("token_id"),
-        intent: r.get("intent"),
-        req: TransferRequest {
-            id, merchant_id, asset,
-            from: SourceAccount {
-                address: r.get("from_address"),
-                kind: AddressKind::from_db(r.get::<String, _>("from_kind").as_str()).ok_or("bad from_kind")?,
-                authority,
+        Ok(TransferRow {
+            id: r.id,
+            merchant_id: r.merchant_id,
+            asset_id: r.asset_id,
+            token_id: r.token_id,
+            intent: r.intent,
+            req: TransferRequest {
+                id: r.id,
+                merchant_id: r.merchant_id,
+                asset,
+                from: SourceAccount {
+                    address: r.from_address,
+                    kind: AddressKind::from_db(r.from_kind.as_str()).ok_or("bad from_kind")?,
+                    authority,
+                },
+                to: r.to_address,
+                amount,
+                fee_payer: signer(r.fee_payer_role, r.fee_payer_index)?,
+                params: r.params,
             },
-            to: r.get("to_address"),
-            amount,
-            fee_payer: signer(r.get("fee_payer_role"), r.get("fee_payer_index"))?,
-            params: r.get::<Value, _>("params"),
-        },
-        tx_hash: r.get("tx_hash"),
-        raw: r.get("raw_tx"),
-        amount_resolved: r.get("amount_resolved"),
-        nonce: r.get("nonce"),
-        valid_until: r.get("valid_until"),
-        fee_estimate: r.get("fee_estimate"),
-    })
+            tx_hash: r.tx_hash,
+            raw: r.raw_tx,
+            amount_resolved: r.amount_resolved,
+            nonce: r.nonce,
+            valid_until: r.valid_until,
+            fee_estimate: r.fee_estimate,
+        })
+    }
 }
 
 /// Claim one row in `status` for this chain, taking a lease. SKIP LOCKED so
 /// two workers on the same chain (multiple processes) don't collide; the
 /// lease handles a worker that died holding a claim.
 async fn claim(pool: &PgPool, net: &dyn NetworkClient, status: &str) -> Result<Option<TransferRow>, String> {
-    let Some(id) = sqlx::query_scalar::<_, Uuid>(CLAIM)
-        .bind(net.network_type())
-        .bind(net.chain_ref())
-        .bind(status)
-        .bind(LEASE)
+    let claimed = sqlx::query!(
+        r#"
+        WITH c AS (
+            SELECT id
+              FROM outbound_transfers
+             WHERE network_type = $1
+               AND chain_ref = $2
+               AND status = $3
+               AND (claimed_at IS NULL OR claimed_at < now() - $4::text::interval)
+             ORDER BY created_at
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED
+        )
+        UPDATE outbound_transfers t
+           SET claimed_at = now(), attempts = attempts + 1, updated_at = now()
+          FROM c
+         WHERE t.id = c.id
+        RETURNING t.id AS "id!"
+        "#,
+        net.network_type(),
+        net.chain_ref(),
+        status,
+        LEASE,
+    )
         .fetch_optional(pool)
         .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
-    };
-    let row = sqlx::query(SELECT_BY_ID)
-        .bind(id)
+        .map_err(|e| format!("claim {status}: {e}"))?;
+
+    let Some(claimed) = claimed else { return Ok(None) };
+    fetch_by_id(pool, claimed.id).await.map(Some)
+}
+
+/// The column list below is duplicated in `load`. `query_as!` takes a literal
+/// and nothing else, so a shared `const` or `concat!` is not available here —
+/// duplication is the price of compile-time checking. If the projection grows,
+/// move it into a view and select from that in both places.
+async fn fetch_by_id(pool: &PgPool, id: Uuid) -> Result<TransferRow, String> {
+    let row = sqlx::query_as!(
+        TransferDbRow,
+        r#"
+        SELECT t.id                     AS "id!",
+               t.merchant_id            AS "merchant_id!",
+               t.asset_id               AS "asset_id!",
+               t.token_id               AS "token_id?",
+               t.intent                 AS "intent!",
+               t.network_type           AS "network_type!",
+               t.chain_ref              AS "chain_ref!",
+               t.from_address           AS "from_address!",
+               t.from_kind              AS "from_kind!",
+               t.authority_role         AS "authority_role!",
+               t.authority_index        AS "authority_index!",
+               t.fee_payer_role         AS "fee_payer_role?",
+               t.fee_payer_index        AS "fee_payer_index?",
+               t.to_address             AS "to_address!",
+               t.amount_requested::text AS "amount_requested?",
+               t.amount_resolved::text  AS "amount_resolved?",
+               t.params                 AS "params!",
+               t.tx_hash                AS "tx_hash?",
+               t.raw_tx                 AS "raw_tx?",
+               t.nonce                  AS "nonce?",
+               t.valid_until            AS "valid_until?",
+               t.fee_estimate::text     AS "fee_estimate?",
+               a.asset_kind             AS "asset_kind!",
+               a.address                AS "asset_address?"
+          FROM outbound_transfers t
+          JOIN assets a ON a.id = t.asset_id
+         WHERE t.id = $1
+        "#,
+        id,
+    )
         .fetch_one(pool)
         .await
-        .map_err(|e| e.to_string())?;
-    from_row(row).map(Some)
+        .map_err(|e| format!("load transfer {id}: {e}"))?;
+    row.try_into()
 }
 
 async fn load(pool: &PgPool, net: &dyn NetworkClient, status: &str) -> Result<Vec<TransferRow>, String> {
-    sqlx::query(SELECT_BY_CHAIN_STATUS)
-        .bind(net.network_type())
-        .bind(net.chain_ref())
-        .bind(status)
+    sqlx::query_as!(
+        TransferDbRow,
+        r#"
+        SELECT t.id                     AS "id!",
+               t.merchant_id            AS "merchant_id!",
+               t.asset_id               AS "asset_id!",
+               t.token_id               AS "token_id?",
+               t.intent                 AS "intent!",
+               t.network_type           AS "network_type!",
+               t.chain_ref              AS "chain_ref!",
+               t.from_address           AS "from_address!",
+               t.from_kind              AS "from_kind!",
+               t.authority_role         AS "authority_role!",
+               t.authority_index        AS "authority_index!",
+               t.fee_payer_role         AS "fee_payer_role?",
+               t.fee_payer_index        AS "fee_payer_index?",
+               t.to_address             AS "to_address!",
+               t.amount_requested::text AS "amount_requested?",
+               t.amount_resolved::text  AS "amount_resolved?",
+               t.params                 AS "params!",
+               t.tx_hash                AS "tx_hash?",
+               t.raw_tx                 AS "raw_tx?",
+               t.nonce                  AS "nonce?",
+               t.valid_until            AS "valid_until?",
+               t.fee_estimate::text     AS "fee_estimate?",
+               a.asset_kind             AS "asset_kind!",
+               a.address                AS "asset_address?"
+          FROM outbound_transfers t
+          JOIN assets a ON a.id = t.asset_id
+         WHERE t.network_type = $1
+           AND t.chain_ref = $2
+           AND t.status = $3
+         ORDER BY t.created_at
+        "#,
+        net.network_type(),
+        net.chain_ref(),
+        status,
+    )
         .fetch_all(pool)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("load {status}: {e}"))?
         .into_iter()
-        .map(from_row)
+        .map(TransferRow::try_from)
         .collect()
 }
 
@@ -335,21 +350,31 @@ async fn sign_and_persist(pool: &PgPool, net: &dyn NetworkClient, row: &Transfer
     let signed = net.build_and_sign(pool, &mnemonic, &row.req).await?;
     drop(mnemonic);
 
-    let n = sqlx::query(PERSIST_SIGNED)
-        .bind(row.id)
-        .bind(&signed.tx_hash)
-        .bind(&signed.raw)
-        .bind(signed.amount.to_string())
-        .bind(signed.nonce.map(|n| n as i64))
-        .bind(signed.valid_until.map(|v| v as i64))
-        .bind(signed.fee_estimate.map(|f| f.to_string()))
+    let n = sqlx::query!(
+        r#"
+        UPDATE outbound_transfers
+           SET status = 'signed', tx_hash = $2, raw_tx = $3,
+               amount_resolved = $4::text::numeric,
+               nonce = $5, valid_until = $6, fee_estimate = $7::text::numeric,
+               claimed_at = NULL, last_error = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'pending'
+        "#,
+        row.id,
+        signed.tx_hash.as_str(),
+        signed.raw.as_slice(),
+        signed.amount.to_string(),
+        signed.nonce.map(|n| n as i64),
+        signed.valid_until.map(|v| v as i64),
+        signed.fee_estimate.map(|f| f.to_string()),
+    )
         .execute(pool)
         .await
         .map_err(|e| format!("persist signed tx: {e}"))?
         .rows_affected();
+
     if n == 0 {
-        // Row left `pending` under us. We hold a signature that is recorded
-        // nowhere — loudly, so it can't be mistaken for a no-op.
+        // Row left `pending` under us. We hold a signature recorded nowhere —
+        // loudly, so it can't be mistaken for a no-op.
         return Err(format!(
             "persist signed tx: row {} no longer pending, hash {} not stored",
             row.id, signed.tx_hash
@@ -362,12 +387,18 @@ async fn sign_and_persist(pool: &PgPool, net: &dyn NetworkClient, row: &Transfer
 /// Retry is the next tick. No back-off/attempt cap yet — policy layer.
 async fn fail_soft(pool: &PgPool, id: Uuid, err: &str) -> Result<(), String> {
     eprintln!("outbound {id}: {err}");
-    sqlx::query(RECORD_ERROR)
-        .bind(id)
-        .bind(err)
+    sqlx::query!(
+        r#"
+        UPDATE outbound_transfers
+           SET last_error = $2, claimed_at = NULL, updated_at = now()
+         WHERE id = $1
+        "#,
+        id,
+        err,
+    )
         .execute(pool)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("record error: {e}"))?;
     Ok(())
 }
 
@@ -375,20 +406,35 @@ async fn fail_soft(pool: &PgPool, id: Uuid, err: &str) -> Result<(), String> {
 /// later transfer can pick them up.
 async fn terminal(pool: &PgPool, row: &TransferRow, status: &str, reason: &str, release: bool) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    sqlx::query(MARK_TERMINAL)
-        .bind(row.id)
-        .bind(status)
-        .bind(reason)
+
+    sqlx::query!(
+        r#"
+        UPDATE outbound_transfers
+           SET status = $2, last_error = $3, claimed_at = NULL, updated_at = now()
+         WHERE id = $1
+        "#,
+        row.id,
+        status,
+        reason,
+    )
         .execute(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("mark {status}: {e}"))?;
+
     if release {
-        sqlx::query(SWEEP_RELEASE)
-            .bind(row.id)
+        sqlx::query!(
+            r#"
+            UPDATE sweep_queue
+               SET status = 'pending', transfer_id = NULL
+             WHERE transfer_id = $1
+            "#,
+            row.id,
+        )
             .execute(&mut *tx)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("release sweep rows: {e}"))?;
     }
+
     tx.commit().await.map_err(|e| e.to_string())
 }
 
@@ -396,22 +442,51 @@ async fn terminal(pool: &PgPool, row: &TransferRow, status: &str, reason: &str, 
 /// into a fresh pending row; sweep rows follow the new row.
 async fn supersede(pool: &PgPool, row: &TransferRow) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    sqlx::query(MARK_EXPIRED)
-        .bind(row.id)
+
+    sqlx::query!(
+        r#"
+        UPDATE outbound_transfers
+           SET status = 'expired', claimed_at = NULL, updated_at = now()
+         WHERE id = $1
+        "#,
+        row.id,
+    )
         .execute(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
-    let new_id: Uuid = sqlx::query_scalar(CLONE_INTENT)
-        .bind(row.id)
+        .map_err(|e| format!("mark expired: {e}"))?;
+
+    let new = sqlx::query!(
+        r#"
+        INSERT INTO outbound_transfers
+            (merchant_id, network_type, chain_ref, asset_id, token_id, intent,
+             from_address, from_kind, authority_role, authority_index, fee_payer_role, fee_payer_index,
+             to_address, amount_requested, params, supersedes)
+        SELECT merchant_id, network_type, chain_ref, asset_id, token_id, intent,
+               from_address, from_kind, authority_role, authority_index, fee_payer_role, fee_payer_index,
+               to_address, amount_requested, params, id
+          FROM outbound_transfers
+         WHERE id = $1
+        RETURNING id AS "id!"
+        "#,
+        row.id,
+    )
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
-    sqlx::query(SWEEP_REPOINT)
-        .bind(row.id)
-        .bind(new_id)
+        .map_err(|e| format!("clone intent: {e}"))?;
+
+    sqlx::query!(
+        r#"
+        UPDATE sweep_queue
+           SET transfer_id = $2, status = 'claimed'
+         WHERE transfer_id = $1
+        "#,
+        row.id,
+        new.id,
+    )
         .execute(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("repoint sweep rows: {e}"))?;
+
     tx.commit().await.map_err(|e| e.to_string())
 }
 
@@ -420,21 +495,35 @@ async fn supersede(pool: &PgPool, row: &TransferRow) -> Result<(), String> {
 async fn settle(pool: &PgPool, ledger: &Ledgerer, row: &TransferRow, signed: &SignedTransfer,
                 block: u64, fee_paid: u128) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-    let n = sqlx::query(MARK_CONFIRMED)
-        .bind(row.id)
-        .bind(block as i64)
-        .bind(fee_paid.to_string())
+
+    let n = sqlx::query!(
+        r#"
+        UPDATE outbound_transfers
+           SET status = 'confirmed', block_number = $2, fee_paid = $3::text::numeric,
+               claimed_at = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'broadcast'
+        "#,
+        row.id,
+        block as i64,
+        fee_paid.to_string(),
+    )
         .execute(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("mark confirmed: {e}"))?
         .rows_affected();
     if n == 0 { return Ok(()); } // someone else settled it
 
-    sqlx::query(SWEEP_MARK_SWEPT)
-        .bind(row.id)
+    sqlx::query!(
+        r#"
+        UPDATE sweep_queue
+           SET status = 'swept'
+         WHERE transfer_id = $1
+        "#,
+        row.id,
+    )
         .execute(&mut *tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("close sweep rows: {e}"))?;
 
     ledger.record_outbound(&mut tx, &OutboundSettled {
         transfer_id: row.id,

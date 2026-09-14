@@ -6,15 +6,20 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::assets::{AssetKey, AssetKind, AssetSpec, NETWORK_SOLANA};
-use crate::networks::sol::SolanaNetwork;
+use crate::assets::{AssetKey, AssetKind, AssetSpec, ChainRef, NETWORK_SOLANA};
+use crate::keys::derivation::{operational, KeyRole};
+use crate::networks::sol::{derive_associated_token_address, SolParams, SolanaNetwork};
 use crate::networks::{NetworkClient, NetworkRegistry, SolanaCluster};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView, PresignContext};
 use crate::keys::store::load_merchant_seed;
+use crate::ledgerer::AddressKind;
+use crate::networks::transfers::{SignerRef, SourceAccount, TransferAmount};
 use crate::tokens::handler::{TokenDescriptor, TokenHandler};
 use crate::tokens::invoicer::{Invoicer, PaymentDetails};
 use crate::tokens::registry::TokenRegistry;
 use crate::tokens::sol_common::sol_checkout_data;
+use crate::tokens::Sweeper;
+use crate::tokens::sweeper::{SweepDraft, TransferPlan};
 
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -109,7 +114,10 @@ pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
 }
 
 fn build_asset(chain_ref: &str, config: &TokenConfig) -> Result<AssetSpec, String> {
-    let key = AssetKey::from_optional_address(NETWORK_SOLANA, chain_ref, config.token_address)?;
+    // Construct the single ChainRef parameter expected by AssetKey
+    let chain = ChainRef::new(NETWORK_SOLANA, chain_ref);
+
+    let key = AssetKey::from_optional_address(chain, config.token_address.as_deref())?;
 
     let params = match key.kind {
         AssetKind::Native => json!({}),
@@ -119,6 +127,7 @@ fn build_asset(chain_ref: &str, config: &TokenConfig) -> Result<AssetSpec, Strin
             // invoice time.
             let program = config
                 .token_program
+                .as_deref()
                 .filter(|p| !p.is_empty())
                 .ok_or_else(|| format!("{} has a mint configured but no token_program", config.id))?;
             json!({
@@ -145,10 +154,40 @@ impl TokenHandler for DevnetHandler {
     fn invoicer(&self) -> Option<&dyn Invoicer> {
         Some(self)
     }
+    fn sweeper(&self) -> Option<&dyn Sweeper> { Some(self) }
+}
 
-    // No `sweeper()` override: devnet funds are not worth moving, and nothing
-    // implements Sweeper yet. The handler still advertises its asset, so the
-    // ledger can denominate devnet balances and show them as non-withdrawable.
+#[async_trait]
+impl Sweeper for DevnetHandler {
+    async fn plan(&self, _pool: &PgPool, d: &SweepDraft) -> Result<TransferPlan, String> {
+        if d.custody_kind != AddressKind::DepositAddress {
+            return Err(format!("cannot sweep from {:?}", d.custody_kind));
+        }
+        let asset = &self.descriptor.asset;
+        let mint = asset.key.address.clone();
+        let token_program = asset.param_str("token_program").map(str::to_string);
+
+        // For SPL, `to` is the main wallet's ATA — which may not exist yet.
+        let to = match (&mint, &token_program) {
+            (Some(m), Some(p)) => derive_associated_token_address(&d.destination, m, p)?,
+            (Some(_), None) => return Err(format!("{}: mint without token_program", self.token_id())),
+            _ => d.destination.clone(),
+        };
+
+        Ok(TransferPlan {
+            from: SourceAccount { address: d.custody_address.clone(), kind: d.custody_kind, authority: d.authority },
+            to,
+            amount: TransferAmount::Max,
+            fee_payer: Some(SignerRef { role: KeyRole::Operational, index: operational::GAS_FEEDER }),
+            params: serde_json::to_value(SolParams {
+                decimals: asset.decimals,
+                to_owner: d.destination.clone(),
+                create_dest_ata: mint.is_some(),
+                close_source: mint.is_some(),
+                mint, token_program,
+            }).unwrap(),
+        })
+    }
 }
 
 #[async_trait]

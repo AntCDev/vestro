@@ -61,6 +61,7 @@ pub struct SignedTransfer {
     pub tx_hash: String,
     pub raw: Vec<u8>,
     /// What the tx actually moves — `Max` resolved to a number.
+    pub from: String,
     pub amount: u128,
     pub valid_until: Option<u64>,
     pub nonce: Option<u64>,

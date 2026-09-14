@@ -6,15 +6,19 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::assets::{AssetKey, AssetSpec, NETWORK_EVM};
+use crate::assets::{AssetKey, AssetSpec, ChainRef, NETWORK_EVM};
 use crate::networks::evm::EVMNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView};
 use crate::keys::store::load_merchant_seed;
+use crate::ledgerer::AddressKind;
+use crate::networks::transfers::{SourceAccount, TransferAmount};
 use crate::tokens::evm_common::{evm_checkout_data, TokenConfig};
 use crate::tokens::handler::{TokenDescriptor, TokenHandler};
 use crate::tokens::invoicer::{Invoicer, PaymentDetails};
 use crate::tokens::registry::TokenRegistry;
+use crate::tokens::Sweeper;
+use crate::tokens::sweeper::{SweepDraft, TransferPlan};
 
 const CHAIN_ID: u64 = 11155111;
 #[allow(dead_code)]
@@ -81,8 +85,9 @@ pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
     let chain_ref = network.chain_ref();
 
     for config in SEPOLIA_TOKENS {
-        let key = match AssetKey::from_optional_address(NETWORK_EVM, &chain_ref, config.token_address)
-        {
+        let chain = ChainRef::new(NETWORK_EVM, &chain_ref); // Or construct ChainRef appropriately
+
+        let key = match AssetKey::from_optional_address(chain, config.token_address.as_deref()) {
             Ok(k) => k,
             Err(e) => {
                 println!("  ❌ {} not registered: {e}", config.id);
@@ -136,7 +141,27 @@ impl TokenHandler for SepoliaHandler {
     // If sweeping ever needs state this handler shouldn't hold (a hot key, a
     // nonce manager), make it a separate struct stored as
     // `sweeper: Option<Arc<EvmSweeper>>` and return `self.sweeper.as_deref()`.
+    fn sweeper(&self) -> Option<&dyn Sweeper> { Some(self) }
 }
+
+#[async_trait]
+impl Sweeper for SepoliaHandler {
+    async fn plan(&self, _pool: &PgPool, d: &SweepDraft) -> Result<TransferPlan, String> {
+        match d.custody_kind {
+            AddressKind::DepositAddress => {}
+            AddressKind::Vault => return Err("vault sweeps not implemented — see Phase 5 vault model".into()),
+            k => return Err(format!("cannot sweep from {k:?}")),
+        }
+        Ok(TransferPlan {
+            from: SourceAccount { address: d.custody_address.clone(), kind: d.custody_kind, authority: d.authority },
+            to: d.destination.clone(),
+            amount: TransferAmount::Max,
+            fee_payer: None, // SelfFunded: deposit address pays its own gas
+            params: json!({}),
+        })
+    }
+}
+
 
 #[async_trait]
 impl Invoicer for SepoliaHandler {

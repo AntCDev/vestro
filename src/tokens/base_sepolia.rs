@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::assets::{AssetKey, AssetSpec, NETWORK_EVM};
+use crate::assets::{AssetKey, AssetSpec, ChainRef, NETWORK_EVM};
 use crate::networks::evm::EVMNetwork;
 use crate::networks::{NetworkClient, NetworkRegistry};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView};
@@ -71,7 +71,10 @@ pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
     let chain_ref = network.chain_ref();
 
     for config in BASE_SEPOLIA_TOKENS {
-        let key = match AssetKey::from_optional_address(NETWORK_EVM, &chain_ref, config.token_address)
+        // Construct the single ChainRef expected by AssetKey
+        let chain = ChainRef::new(NETWORK_EVM, &chain_ref);
+
+        let key = match AssetKey::from_optional_address(chain, config.token_address.as_deref())
         {
             Ok(k) => k,
             Err(e) => {
@@ -102,7 +105,6 @@ pub fn register(registry: &mut TokenRegistry, networks: Arc<NetworkRegistry>) {
         });
     }
 }
-
 pub struct BaseSepoliaHandler {
     network: Arc<EVMNetwork>,
     config: TokenConfig,

@@ -45,18 +45,21 @@ use ripemd::Ripemd160;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use crate::keys::derivation::{DerivationScheme, DerivedAddress, KeyRole, SCHEME_VERSION};
 use crate::keys::store::assert_scheme;
 use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets};
 use crate::ledgerer::{AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer, ObservedInbound, ObservedTransfer, OrphanInput, OrphanOutcome, PaymentPath, RecognizeInput};
 use super::{enqueue_webhook, Amount, BitcoinNetwork, GasModel, NetworkClient, PaymentWatch};
 
+use crate::networks::esplora_tx::*;
+use crate::networks::transfers::{SignedTransfer, TransferAmount, TransferRequest, TransferStatus};
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +277,73 @@ struct InvoiceTotals {
     finished_now: bool,
 }
 
+
+/// Depth a UTXO must reach before the sweeper will spend it. Deliberately
+/// equal to FINAL_CONFIRMATIONS: that's the latch `recognize_payment` fires
+/// on, so we can only ever spend value the ledger has already recognized.
+/// This is what makes `LedgerError::SweepInFlight` unreachable here.
+const SWEEP_MIN_CONFIRMATIONS: u64 = FINAL_CONFIRMATIONS as u64;
+
+/// Depth before an outbound transfer is reported Confirmed. There's no orphan
+/// path for outbound_transfers yet, so 1 conf would let a reorg un-book a
+/// settled sweep.
+const OUTBOUND_CONFIRMATIONS: u64 = 3;
+
+/// Standardness caps a tx at 100 kvB; 300 P2WPKH inputs is ~20 kvB.
+const MAX_SWEEP_INPUTS: usize = 300;
+
+/// Fee-estimate target. Sweeps are never urgent.
+const DEFAULT_FEE_TARGET_BLOCKS: u32 = 6;
+
+/// Floor when `/fee-estimates` is missing or nonsense. 1 sat/vB is min-relay.
+const MIN_FEE_RATE: f64 = 1.0;
+
+/// Refuse to sweep when the fee would eat this share of the value. Without it
+/// a 400-sat dust deposit produces a transaction that pays the miner more than
+/// the merchant and still fails the dust check downstream.
+const MAX_FEE_SHARE: f64 = 0.25;
+
+#[derive(Deserialize)]
+struct EsploraUtxo {
+    txid: String,
+    vout: u32,
+    value: u64,
+    #[serde(default)]
+    status: EsploraTxStatus,
+}
+
+#[derive(Deserialize)]
+struct EsploraOutspend {
+    #[serde(default)]
+    spent: bool,
+    txid: Option<String>,
+    #[serde(default)]
+    status: EsploraTxStatus,
+}
+
+#[derive(Deserialize)]
+struct EsploraTxDetail {
+    #[serde(default)]
+    fee: u64,
+    status: EsploraTxStatus,
+}
+
+/// Chain-specific half of a Bitcoin sweep, carried in `outbound_transfers.params`.
+#[derive(Serialize, Deserialize)]
+pub struct BtcParams {
+    #[serde(default = "default_min_confs")]
+    pub min_confirmations: u64,
+    #[serde(default = "default_fee_target")]
+    pub fee_target_blocks: u32,
+}
+fn default_min_confs() -> u64 { SWEEP_MIN_CONFIRMATIONS }
+fn default_fee_target() -> u32 { DEFAULT_FEE_TARGET_BLOCKS }
+impl Default for BtcParams {
+    fn default() -> Self {
+        Self { min_confirmations: SWEEP_MIN_CONFIRMATIONS, fee_target_blocks: DEFAULT_FEE_TARGET_BLOCKS }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Network
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +426,99 @@ impl EsploraNetwork {
         st.block_time.and_then(|t| DateTime::<Utc>::from_timestamp(t as i64, 0))
     }
 
+
+    /// POST with the raw body. Unlike `get_text` this fans out to *every*
+    /// endpoint rather than stopping at the first success — more endpoints
+    /// seeing the transaction means better propagation, and acceptance is
+    /// idempotent.
+    async fn post_all(&self, path: &str, body: String) -> Result<String, String> {
+        let mut accepted: Option<String> = None;
+        let mut errors: Vec<String> = Vec::new();
+
+        for base in &self.api_urls {
+            let url = format!("{}{path}", base.trim_end_matches('/'));
+            match self.client.post(&url).body(body.clone()).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        accepted.get_or_insert(text.trim().to_string());
+                    } else if is_already_known(&text) {
+                        accepted.get_or_insert_with(String::new);
+                    } else {
+                        errors.push(format!("{url}: HTTP {status}: {}", truncate(&text, 200)));
+                    }
+                }
+                Err(e) => errors.push(format!("{url}: {e}")),
+            }
+        }
+
+        match accepted {
+            Some(txid) => Ok(txid),
+            None => Err(errors.join("; ")),
+        }
+    }
+
+    async fn fee_rate(&self, target: u32) -> f64 {
+        let map: HashMap<String, f64> = match self.get_json("/fee-estimates").await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[esplora:{}] fee-estimates: {e}; using {MIN_FEE_RATE} sat/vB", self.chain_ref);
+                return MIN_FEE_RATE;
+            }
+        };
+        // Walk out from the requested target; estimates get sparser further out.
+        let rate = (target..=target + 20)
+            .find_map(|t| map.get(&t.to_string()).copied())
+            .or_else(|| map.get("6").copied())
+            .unwrap_or(MIN_FEE_RATE);
+        if rate.is_finite() && rate >= MIN_FEE_RATE { rate } else { MIN_FEE_RATE }
+    }
+
+    /// Spendable outpoints at `address`, deepest first. Mempool and shallow
+    /// UTXOs are excluded — see SWEEP_MIN_CONFIRMATIONS.
+    async fn spendable_utxos(&self, address: &str, min_confs: u64) -> Result<Vec<TxIn>, String> {
+        let tip = self.tip_height.load(Ordering::Relaxed);
+        if tip == 0 {
+            return Err("tip unknown; chain watcher hasn't anchored yet".into());
+        }
+        let utxos: Vec<EsploraUtxo> = match self.get_json(&format!("/address/{address}/utxo")).await {
+            Ok(v) => v,
+            Err(ApiError::NotFound) => Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        };
+
+        let mut out = Vec::new();
+        for u in utxos {
+            let Some(h) = u.status.block_height.filter(|_| u.status.confirmed) else { continue };
+            if confirmations_for(h, tip) < min_confs as i64 { continue; }
+            if u.value == 0 { continue; }
+            out.push(TxIn { txid: txid_from_display(&u.txid)?, vout: u.vout, value: u.value });
+        }
+        out.sort_by_key(|i| std::cmp::Reverse(i.value));
+        out.truncate(MAX_SWEEP_INPUTS);
+        Ok(out)
+    }
+
+    /// The signing key behind a derived address. Mirrors `derive`, which only
+    /// returns the public half.
+    fn keypair(&self, mnemonic: &str, role: KeyRole, index: u32) -> Result<(SigningKey, String), String> {
+        let scheme = esplora_scheme();
+        let seed = scheme.seed(mnemonic)?;
+        let path = scheme.path(role, index)?;
+        let xprv = XPrv::derive_from_path(&seed, &path)
+            .map_err(|e| format!("derive {}: {e}", scheme.path_string(role, index)))?;
+
+        // Borrow and clone the SigningKey directly
+        let key = xprv.private_key().clone();
+
+        let derived = self.derive(mnemonic, role, index)?;
+        Ok((key, derived.address))
+    }
+
+    fn script_for(&self, address: &str) -> Result<Vec<u8>, String> {
+        script_pubkey(address, |s| base58check_decode(s))
+    }
 
     // ── HTTP ────────────────────────────────────────────────────────────────
     //
@@ -1480,6 +1643,13 @@ impl EsploraNetwork {
     }
 }
 
+fn is_already_known(body: &str) -> bool {
+    let l = body.to_lowercase();
+    l.contains("txn-already-in-mempool")
+        || l.contains("txn-already-known")
+        || l.contains("already in block chain")
+        || l.contains("transaction already in block chain")
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared write helpers
@@ -1866,6 +2036,176 @@ impl NetworkClient for EsploraNetwork {
     async fn get_current_block(&self) -> Result<u64, String> {
         self.fetch_tip_height().await.map_err(|e| e.to_string())
     }
+
+    async fn build_and_sign(&self, _pool: &PgPool, mnemonic: &str, req: &TransferRequest)
+                            -> Result<SignedTransfer, String>
+    {
+        if req.fee_payer.is_some() {
+            return Err("esplora is InputFunded: fee_payer must be None".into());
+        }
+        if req.asset.address.is_some() {
+            return Err("Bitcoin has no token layer; asset.address must be None".into());
+        }
+        let p: BtcParams = if req.params.is_null() {
+            BtcParams::default()
+        } else {
+            serde_json::from_value(req.params.clone()).map_err(|e| format!("params: {e}"))?
+        };
+
+        let (key, derived) = self.keypair(mnemonic, req.from.authority.role, req.from.authority.index)?;
+        if derived != req.from.address {
+            return Err(format!(
+                "authority {} derives {derived} but from_address is {} — refusing to sign",
+                req.from.authority.to_ref(), req.from.address));
+        }
+
+        let dest_script = self.script_for(&req.to)?;
+        let change_script = self.script_for(&req.from.address)?;
+        let rate = self.fee_rate(p.fee_target_blocks).await;
+
+        let utxos = self.spendable_utxos(&req.from.address, p.min_confirmations).await?;
+        if utxos.is_empty() {
+            return Err(format!(
+                "{}: no UTXOs at {}+ confirmations", req.from.address, p.min_confirmations));
+        }
+
+        let (ins, outs, fee) = match req.amount {
+            TransferAmount::Max => {
+                let total: u64 = utxos.iter().map(|u| u.value).sum();
+                let mut outs = vec![TxOut { value: 0, script: dest_script.clone() }];
+                let fee = (rate * vsize(utxos.len(), &outs) as f64).ceil() as u64;
+                let value = total.checked_sub(fee).ok_or_else(|| format!(
+                    "{}: {total} sats across {} input(s) can't cover a {fee} sat fee",
+                    req.from.address, utxos.len()))?;
+                if (fee as f64) > total as f64 * MAX_FEE_SHARE {
+                    return Err(format!(
+                        "{}: uneconomic — {fee} sat fee against {total} sats at {rate:.1} sat/vB",
+                        req.from.address));
+                }
+                if value < dust_floor(&dest_script) {
+                    return Err(format!("{}: net {value} sats is below dust", req.from.address));
+                }
+                outs[0].value = value;
+                (utxos, outs, fee)
+            }
+            TransferAmount::Exact(n) => {
+                let want = u64::try_from(n).map_err(|_| format!("amount {n} exceeds u64 sats"))?;
+                if want < dust_floor(&dest_script) {
+                    return Err(format!("amount {want} is below dust for {}", req.to));
+                }
+                let mut chosen: Vec<TxIn> = Vec::new();
+                let mut total = 0u64;
+                let mut fee = 0u64;
+                // Largest-first. Sweeps are the overwhelmingly common path and
+                // are always Max, so this doesn't need to be smart.
+                for u in utxos {
+                    total += u.value;
+                    chosen.push(u);
+                    let two = [
+                        TxOut { value: want, script: dest_script.clone() },
+                        TxOut { value: 0, script: change_script.clone() },
+                    ];
+                    fee = (rate * vsize(chosen.len(), &two) as f64).ceil() as u64;
+                    if total >= want + fee { break; }
+                }
+                if total < want + fee {
+                    return Err(format!("{}: have {total} sats, need {} incl. fee",
+                                       req.from.address, want + fee));
+                }
+                let mut outs = vec![TxOut { value: want, script: dest_script.clone() }];
+                let change = total - want - fee;
+                if change >= dust_floor(&change_script) {
+                    outs.push(TxOut { value: change, script: change_script });
+                } else {
+                    // Dust change: recompute without it. The remainder becomes fee.
+                    fee = total - want;
+                }
+                (chosen, outs, fee)
+            }
+        };
+
+        let delivered = outs[0].value;
+        // locktime 0: no anti-fee-sniping. Sweeps to our own wallet aren't worth
+        // the extra state, and it keeps the tx valid regardless of tip drift.
+        let (raw, txid) = sign_p2wpkh(&key, &ins, &outs, 0)?;
+
+        Ok(SignedTransfer {
+            tx_hash: txid,
+            raw,
+            from: req.from.address.clone(),
+            amount: delivered as u128,
+            // UTXO transactions don't expire on a clock. They die when an input
+            // is spent elsewhere, which transfer_status detects directly.
+            valid_until: None,
+            nonce: None,
+            fee_estimate: Some(fee as u128),
+        })
+    }
+
+    async fn broadcast(&self, signed: &SignedTransfer) -> Result<(), String> {
+        let hex_tx = hex::encode(&signed.raw);
+        match self.post_all("/tx", hex_tx).await {
+            Ok(txid) => {
+                if !txid.is_empty() && txid != signed.tx_hash {
+                    // Our txid computation disagrees with the node's. That's a
+                    // serialisation bug and the transfer row would now be
+                    // tracking a hash that will never confirm.
+                    return Err(format!(
+                        "txid mismatch: computed {} but node returned {txid}", signed.tx_hash));
+                }
+                Ok(())
+            }
+            Err(e) if is_already_known(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn transfer_status(&self, signed: &SignedTransfer) -> Result<TransferStatus, String> {
+        let tip = self.tip_height.load(Ordering::Relaxed);
+
+        match self.get_json::<EsploraTxDetail>(&format!("/tx/{}", signed.tx_hash)).await {
+            Ok(detail) => {
+                let Some(h) = detail.status.block_height.filter(|_| detail.status.confirmed) else {
+                    return Ok(TransferStatus::Pending); // in a mempool somewhere
+                };
+                if confirmations_for(h, tip) < OUTBOUND_CONFIRMATIONS as i64 {
+                    return Ok(TransferStatus::Pending);
+                }
+                Ok(TransferStatus::Confirmed { block: h, fee_paid: detail.fee as u128 })
+            }
+
+            // No endpoint has it. Either it never propagated, or something else
+            // spent our inputs. Only the latter is terminal.
+            Err(ApiError::NotFound) => {
+                let outpoints = parse_outpoints(&signed.raw)?;
+                // Every input belongs to the same address and the same key, so
+                // one stolen input kills the transaction. Check a few, not all.
+                for (prev_txid, vout) in outpoints.iter().take(4) {
+                    let spends: Vec<EsploraOutspend> = match self
+                        .get_json(&format!("/tx/{prev_txid}/outspends")).await
+                    {
+                        Ok(v) => v,
+                        // The funding transaction itself is gone (reorged out).
+                        // Our transaction can never be valid again.
+                        Err(ApiError::NotFound) => return Ok(TransferStatus::Expired),
+                        Err(e) => return Err(e.to_string()),
+                    };
+                    let Some(o) = spends.get(*vout as usize) else { continue };
+                    if o.spent
+                        && o.status.confirmed
+                        && o.txid.as_deref() != Some(signed.tx_hash.as_str())
+                    {
+                        return Ok(TransferStatus::Expired);
+                    }
+                }
+                Ok(TransferStatus::Unknown)
+            }
+
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn outbound_poll_interval(&self) -> StdDuration { StdDuration::from_secs(30) }
 
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
         println!(

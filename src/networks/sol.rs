@@ -8,8 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::{sleep};
 use std::time::Instant;
-
-use ed25519_dalek::SigningKey;
+use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac}; // Added KeyInit here
 use sha2::{Sha256, Sha512, Digest};
 use sqlx::PgPool;
@@ -32,7 +31,8 @@ use crate::ledgerer::{
     AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
     ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
 };
-
+use ed25519_dalek::{Signer, SigningKey};
+use crate::networks::transfers::{SignedTransfer, TransferAmount, TransferRequest, TransferStatus};
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -66,12 +66,16 @@ struct SolTokenAccountsValue {
     value: Vec<serde_json::Value>,
 }
 
+#[derive(Clone)]
+pub struct Meta { pub key: [u8; 32], pub signer: bool, pub writable: bool }
+pub struct Instr { pub program: [u8; 32], pub accounts: Vec<Meta>, pub data: Vec<u8> }
 
 type HmacSha512 = Hmac<Sha512>;
 const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 pub const SOLANA_COIN_TYPE: u32 = 501;
 pub const SOLANA_TEMPLATE: &str = "m/44'/{coin}'/{role}'/{index}'";
 pub const SOLANA_HARDENED_OFFSET: u32 = 0x8000_0000;
@@ -211,7 +215,7 @@ fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> Result<([u8; 
 }
 
 /// Derives the Associated Token Account address for `owner_address` + `mint_address`.
-fn derive_associated_token_address(
+pub fn derive_associated_token_address(
     owner_address: &str,
     mint_address: &str,
     token_program_id: &str,
@@ -230,6 +234,118 @@ fn derive_associated_token_address(
 
     Ok(bs58::encode(ata_bytes).into_string())
 }
+
+
+fn compact_u16(mut n: u16, out: &mut Vec<u8>) {
+    loop {
+        let mut b = (n & 0x7f) as u8; n >>= 7;
+        if n == 0 { out.push(b); return; }
+        b |= 0x80; out.push(b);
+    }
+}
+
+/// Legacy (v0-less) message. Returns (message_bytes, ordered_signer_pubkeys).
+pub fn compile(fee_payer: [u8; 32], instrs: &[Instr], blockhash: [u8; 32]) -> (Vec<u8>, Vec<[u8; 32]>) {
+    // Merge flags per key; fee payer is always first, signer+writable.
+    let mut metas: Vec<Meta> = vec![Meta { key: fee_payer, signer: true, writable: true }];
+    let mut upsert = |m: Meta| {
+        if let Some(e) = metas.iter_mut().find(|e| e.key == m.key) {
+            e.signer |= m.signer; e.writable |= m.writable;
+        } else { metas.push(m); }
+    };
+    for ix in instrs {
+        for a in &ix.accounts { upsert(a.clone()); }
+        upsert(Meta { key: ix.program, signer: false, writable: false });
+    }
+    // Stable partition: signer+w, signer+ro, nonsigner+w, nonsigner+ro. Fee payer stays at 0.
+    let rank = |m: &Meta| match (m.signer, m.writable) {
+        (true, true) => 0, (true, false) => 1, (false, true) => 2, (false, false) => 3 };
+    let head = metas.remove(0);
+    metas.sort_by_key(|m| rank(m));
+    metas.insert(0, head);
+
+    let n_signed = metas.iter().filter(|m| m.signer).count() as u8;
+    let n_ro_signed = metas.iter().filter(|m| m.signer && !m.writable).count() as u8;
+    let n_ro_unsigned = metas.iter().filter(|m| !m.signer && !m.writable).count() as u8;
+    let idx = |k: &[u8; 32]| metas.iter().position(|m| &m.key == k).unwrap() as u8;
+
+    let mut out = vec![n_signed, n_ro_signed, n_ro_unsigned];
+    compact_u16(metas.len() as u16, &mut out);
+    for m in &metas { out.extend_from_slice(&m.key); }
+    out.extend_from_slice(&blockhash);
+    compact_u16(instrs.len() as u16, &mut out);
+    for ix in instrs {
+        out.push(idx(&ix.program));
+        compact_u16(ix.accounts.len() as u16, &mut out);
+        for a in &ix.accounts { out.push(idx(&a.key)); }
+        compact_u16(ix.data.len() as u16, &mut out);
+        out.extend_from_slice(&ix.data);
+    }
+    let signers = metas.iter().filter(|m| m.signer).map(|m| m.key).collect();
+    (out, signers)
+}
+
+/// Serialize the wire tx. `keys` must contain one key per pubkey in `signers`,
+/// in any order. Returns (raw_tx, base58 first signature == tx id).
+pub fn sign(message: &[u8], signers: &[[u8; 32]], keys: &[SigningKey]) -> Result<(Vec<u8>, String), String> {
+    let mut out = Vec::new();
+    compact_u16(signers.len() as u16, &mut out);
+    let mut first = None;
+    for pk in signers {
+        let k = keys.iter().find(|k| &k.verifying_key().to_bytes() == pk)
+            .ok_or_else(|| format!("no signing key for required signer {}", bs58::encode(pk).into_string()))?;
+        let sig = k.sign(message).to_bytes();
+        if first.is_none() { first = Some(bs58::encode(&sig).into_string()); }
+        out.extend_from_slice(&sig);
+    }
+    out.extend_from_slice(message);
+    Ok((out, first.unwrap()))
+}
+
+// ── instruction builders ──────────────────────────────────────────────────
+pub fn system_transfer(from: [u8; 32], to: [u8; 32], lamports: u64) -> Instr {
+    let mut data = 2u32.to_le_bytes().to_vec(); data.extend_from_slice(&lamports.to_le_bytes());
+    Instr { program: pk(SYSTEM_PROGRAM), data, accounts: vec![
+        Meta { key: from, signer: true, writable: true },
+        Meta { key: to, signer: false, writable: true },
+    ]}
+}
+
+/// TransferChecked (12) — works for both Token and Token-2022.
+pub fn token_transfer_checked(program: [u8; 32], src: [u8; 32], mint: [u8; 32], dst: [u8; 32],
+                              owner: [u8; 32], amount: u64, decimals: u8) -> Instr {
+    let mut data = vec![12]; data.extend_from_slice(&amount.to_le_bytes()); data.push(decimals);
+    Instr { program, data, accounts: vec![
+        Meta { key: src, signer: false, writable: true },
+        Meta { key: mint, signer: false, writable: false },
+        Meta { key: dst, signer: false, writable: true },
+        Meta { key: owner, signer: true, writable: false },
+    ]}
+}
+
+/// CloseAccount (9): rent lamports → `rent_to`.
+pub fn token_close(program: [u8; 32], account: [u8; 32], rent_to: [u8; 32], owner: [u8; 32]) -> Instr {
+    Instr { program, data: vec![9], accounts: vec![
+        Meta { key: account, signer: false, writable: true },
+        Meta { key: rent_to, signer: false, writable: true },
+        Meta { key: owner, signer: true, writable: false },
+    ]}
+}
+
+/// ATA CreateIdempotent (1): no-op if it already exists.
+pub fn ata_create_idempotent(payer: [u8; 32], ata: [u8; 32], owner: [u8; 32], mint: [u8; 32], token_program: [u8; 32]) -> Instr {
+    Instr { program: pk(ASSOCIATED_TOKEN_PROGRAM_ID), data: vec![1], accounts: vec![
+        Meta { key: payer, signer: true, writable: true },
+        Meta { key: ata, signer: false, writable: true },
+        Meta { key: owner, signer: false, writable: false },
+        Meta { key: mint, signer: false, writable: false },
+        Meta { key: pk(SYSTEM_PROGRAM), signer: false, writable: false },
+        Meta { key: token_program, signer: false, writable: false },
+    ]}
+}
+
+pub fn pk(s: &str) -> [u8; 32] { decode_pubkey(s).expect("static pubkey") }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -551,6 +667,18 @@ struct SigScan {
     sigs: Vec<SigRef>,
     complete: bool,
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct SolParams {
+    pub mint: Option<String>,
+    pub token_program: Option<String>,
+    pub decimals: u8,
+    /// Owner of `to` (main wallet). `to` itself is the destination ATA for SPL.
+    pub to_owner: String,
+    pub create_dest_ata: bool,
+    pub close_source: bool,
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ### NETWORK IMPLEMENTATION ###
@@ -1464,7 +1592,7 @@ impl SolanaNetwork {
             transfers.push(ObservedTransfer {
                 event_index,
                 event_ref: Some(event_ref),
-                asset: self.asset_for(inv.mint.as_deref()),
+                asset: self.asset_for(inv.mint.as_deref())?,
                 amount: c.amount,
                 from_address: tx.debit_source(inv.mint.as_deref()),
                 from_kind: Some(AddressKind::External),
@@ -2460,6 +2588,16 @@ impl SolanaNetwork {
         Ok(())
     }
 
+    async fn get_lamports(&self, addr: &str) -> Result<u64, String> {
+        let v = self.rpc("getBalance", json!([addr, { "commitment": "confirmed" }])).await?;
+        v["value"].as_u64().ok_or_else(|| format!("getBalance: {v}"))
+    }
+    async fn get_token_account_amount(&self, ata: &str) -> Result<u64, String> {
+        let v = self.rpc("getTokenAccountBalance", json!([ata, { "commitment": "confirmed" }])).await?;
+        v["value"]["amount"].as_str().ok_or("getTokenAccountBalance: no amount")?
+            .parse().map_err(|e| format!("amount: {e}"))
+    }
+
     pub async fn get_finalized_block(&self) -> Result<u64, String> {
         let slot = self.get_slot(FINALIZED_COMMITMENT).await?;
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
@@ -2758,6 +2896,123 @@ impl NetworkClient for SolanaNetwork {
     async fn get_token_balance(&self, token_address: &str, address: &str, decimals: u8) -> Result<Amount, String> {
         todo!()
     }
+
+    async fn build_and_sign(&self, _pool: &PgPool, mnemonic: &str, req: &TransferRequest)
+                            -> Result<SignedTransfer, String>
+    {
+        let p: SolParams = serde_json::from_value(req.params.clone())
+            .map_err(|e| format!("params: {e}"))?;
+
+        let (auth_key, auth_addr) = derive_solana_keypair(mnemonic, req.from.authority.role, req.from.authority.index)?;
+        let (fee_key, fee_addr) = match req.fee_payer {
+            Some(s) => derive_solana_keypair(mnemonic, s.role, s.index)?,
+            None => (auth_key.clone(), auth_addr.clone()),
+        };
+        let auth = decode_pubkey(&auth_addr)?;
+        let payer = decode_pubkey(&fee_addr)?;
+        let to = decode_pubkey(&req.to)?;
+        let mut keys = vec![auth_key];
+        if fee_addr != auth_addr { keys.push(fee_key); }
+        let n_sigs = keys.len() as u64;
+
+        let mut instrs = Vec::new();
+        let amount: u64;
+
+        match (&p.mint, &p.token_program) {
+            (None, _) => {
+                // Native: from.address must be the authority itself.
+                if req.from.address != auth_addr {
+                    return Err(format!("native sweep: from {} != authority {}", req.from.address, auth_addr));
+                }
+                let bal = self.get_lamports(&auth_addr).await?;
+                amount = match req.amount {
+                    TransferAmount::Exact(n) => n as u64,
+                    TransferAmount::Max if fee_addr != auth_addr => bal,
+                    TransferAmount::Max => bal.checked_sub(5_000 * n_sigs)
+                        .ok_or_else(|| format!("{auth_addr}: {bal} lamports can't cover its own fee"))?,
+                };
+                if amount == 0 { return Err(format!("{auth_addr}: nothing to sweep")); }
+                instrs.push(system_transfer(auth, to, amount));
+            }
+            (Some(mint_s), Some(prog_s)) => {
+                let expect_ata = derive_associated_token_address(&auth_addr, mint_s, prog_s)?;
+                if req.from.address != expect_ata {
+                    return Err(format!("SPL sweep: from {} is not the ATA of authority {} ({expect_ata})",
+                                       req.from.address, auth_addr));
+                }
+                let (mint, prog, src) = (decode_pubkey(mint_s)?, decode_pubkey(prog_s)?, decode_pubkey(&req.from.address)?);
+                amount = match req.amount {
+                    TransferAmount::Exact(n) => n as u64,
+                    TransferAmount::Max => self.get_token_account_amount(&req.from.address).await?,
+                };
+                if amount == 0 { return Err(format!("{}: token account empty", req.from.address)); }
+                if p.create_dest_ata {
+                    instrs.push(ata_create_idempotent(payer, to, decode_pubkey(&p.to_owner)?, mint, prog));
+                }
+                instrs.push(token_transfer_checked(prog, src, mint, to, auth, amount, p.decimals));
+                if p.close_source {
+                    // Rent refunds the fee payer. Merchant-scoped either way.
+                    instrs.push(token_close(prog, src, payer, auth));
+                }
+            }
+            (Some(_), None) => return Err("SPL sweep without token_program".into()),
+        }
+
+        // Fresh blockhash — do NOT use the cached one, the cache TTL eats validity window.
+        let bh = self.rpc("getLatestBlockhash", json!([{ "commitment": "confirmed" }])).await?;
+        let v = bh.get("value").unwrap_or(&bh);
+        let blockhash = decode_pubkey(v["blockhash"].as_str().ok_or("no blockhash")?)?;
+        let last_valid = v["lastValidBlockHeight"].as_u64().ok_or("no lastValidBlockHeight")?;
+
+        let (msg, signers) = compile(payer, &instrs, blockhash);
+        let (raw, sig) = sign(&msg, &signers, &keys)?;
+
+        Ok(SignedTransfer {
+            tx_hash: sig, raw, amount: amount as u128,
+            from: req.from.address.clone(),
+            valid_until: Some(last_valid),
+            nonce: None,
+            fee_estimate: Some(5_000 * n_sigs as u128),
+        })
+    }
+
+    async fn broadcast(&self, signed: &SignedTransfer) -> Result<(), String> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&signed.raw);
+        match self.rpc("sendTransaction", json!([b64, {
+            "encoding": "base64", "skipPreflight": false, "preflightCommitment": "confirmed", "maxRetries": 3
+        }])).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.contains("already been processed") || e.contains("AlreadyProcessed") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn transfer_status(&self, signed: &SignedTransfer) -> Result<TransferStatus, String> {
+        let res = self.rpc("getSignatureStatuses",
+                           json!([[signed.tx_hash], { "searchTransactionHistory": true }])).await?;
+        let st = &res["value"][0];
+
+        if st.is_null() {
+            if let Some(valid_until) = signed.valid_until {
+                let h = self.rpc("getBlockHeight", json!([{ "commitment": "finalized" }])).await?;
+                if h.as_u64().unwrap_or(0) > valid_until { return Ok(TransferStatus::Expired); }
+            }
+            return Ok(TransferStatus::Unknown);
+        }
+        if !st["err"].is_null() {
+            return Ok(TransferStatus::Failed { reason: st["err"].to_string() });
+        }
+        if st["confirmationStatus"].as_str() != Some("finalized") {
+            return Ok(TransferStatus::Pending);
+        }
+        let slot = st["slot"].as_u64().unwrap_or(0);
+        let tx = self.rpc("getTransaction", json!([signed.tx_hash,
+            { "encoding": "json", "commitment": "finalized", "maxSupportedTransactionVersion": 0 }])).await?;
+        let fee_paid = tx["meta"]["fee"].as_u64().unwrap_or(0) as u128;
+        Ok(TransferStatus::Confirmed { block: slot, fee_paid })
+    }
+
+    fn outbound_poll_interval(&self) -> Duration { Duration::from_secs(5) }
 
     /// Current slot at detection commitment. Stored as invoices.created_block so
     /// cold-start scans never page below the invoice's own birth.

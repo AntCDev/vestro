@@ -23,6 +23,7 @@ pub mod sol;
 pub mod esplora;
 pub mod transfers;
 pub mod outbound;
+pub mod esplora_tx;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SolanaCluster {

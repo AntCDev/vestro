@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE outbound_transfers\n           SET status = 'expired', claimed_at = NULL, updated_at = now()\n         WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5a4ad2bee54e06b70b0a84c6f4a013d7a3db25442f5e490cb60241874f7f804e"
+}

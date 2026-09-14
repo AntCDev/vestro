@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address FROM merchant_wallets WHERE merchant_id = $1 AND network_type = $2 AND purpose = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "merchant_wallets",
+            "name": "address"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "adcd4ab04f15db071ab40a826312c702c85d2f0d27a030445ae077ebe9ddff17"
+}

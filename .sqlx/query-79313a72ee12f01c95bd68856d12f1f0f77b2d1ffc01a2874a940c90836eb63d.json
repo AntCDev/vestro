@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT token_address, token_program FROM invoices WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token_address",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "token_address"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "token_program",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "token_program"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "79313a72ee12f01c95bd68856d12f1f0f77b2d1ffc01a2874a940c90836eb63d"
+}

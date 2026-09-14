@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE invoices\n            SET wallet_address = $1, wallet_index = $2, wallet_role = $3,\n                wallet_path = $4, scheme_version = $5,\n                expires_at = $6, payment_reference = $7,\n                required_confirmations = $8, created_block = $9,\n                updated_at = CURRENT_TIMESTAMP\n            WHERE id = $10\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int4",
+        "Int2",
+        "Text",
+        "Int2",
+        "Timestamptz",
+        "Varchar",
+        "Int2",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "222bfee6794d99920c18417ff64f34a9220fde1c2d719cbfbd3724d9a757c965"
+}

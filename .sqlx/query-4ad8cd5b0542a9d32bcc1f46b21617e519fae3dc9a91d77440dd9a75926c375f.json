@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE outbound_transfers\n           SET last_error = $2, claimed_at = NULL, updated_at = now()\n         WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4ad8cd5b0542a9d32bcc1f46b21617e519fae3dc9a91d77440dd9a75926c375f"
+}

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT m.id\n        FROM merchants m\n        JOIN merchant_key_material km ON m.id = km.merchant_id\n        WHERE km.key_family = 'bip39'\n          AND EXISTS (\n              SELECT 1 FROM unnest($2::text[]) AS want(purpose)\n              WHERE NOT EXISTS (\n                  SELECT 1 FROM merchant_wallets mw\n                  WHERE mw.merchant_id = m.id\n                    AND mw.network_type = $1\n                    AND mw.purpose = want.purpose\n              )\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "merchants",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b43668352ebad436e0225844c41d8fba05308c85598fc2a64d743408b74507af"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE outbound_transfers\n                       SET status = 'broadcast', claimed_at = NULL, updated_at = now()\n                     WHERE id = $1\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fb6bd9aee43140d211134903d677b1c7cd7757738b13a93fe6e33b642372e8ae"
+}

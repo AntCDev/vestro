@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE sweep_queue\n           SET status = 'swept'\n         WHERE transfer_id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a70641a8dda4217ab8c7aea1cf2a0a50da0df3fd247824d9c4bb70f7022c1da1"
+}

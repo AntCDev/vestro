@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE payments SET status = 'orphaned', confirmations = 0, updated_at = CURRENT_TIMESTAMP\n            WHERE id = $1 AND status <> 'orphaned'\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "631fcb800e9b7bc75c32cf23330b6783eda771a70c6b7e734152d9a2192609b2"
+}

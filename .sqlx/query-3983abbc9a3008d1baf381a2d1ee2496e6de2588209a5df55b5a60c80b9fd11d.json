@@ -1,0 +1,289 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT t.id                     AS \"id!\",\n               t.merchant_id            AS \"merchant_id!\",\n               t.asset_id               AS \"asset_id!\",\n               t.token_id               AS \"token_id?\",\n               t.intent                 AS \"intent!\",\n               t.network_type           AS \"network_type!\",\n               t.chain_ref              AS \"chain_ref!\",\n               t.from_address           AS \"from_address!\",\n               t.from_kind              AS \"from_kind!\",\n               t.authority_role         AS \"authority_role!\",\n               t.authority_index        AS \"authority_index!\",\n               t.fee_payer_role         AS \"fee_payer_role?\",\n               t.fee_payer_index        AS \"fee_payer_index?\",\n               t.to_address             AS \"to_address!\",\n               t.amount_requested::text AS \"amount_requested?\",\n               t.amount_resolved::text  AS \"amount_resolved?\",\n               t.params                 AS \"params!\",\n               t.tx_hash                AS \"tx_hash?\",\n               t.raw_tx                 AS \"raw_tx?\",\n               t.nonce                  AS \"nonce?\",\n               t.valid_until            AS \"valid_until?\",\n               t.fee_estimate::text     AS \"fee_estimate?\",\n               a.asset_kind             AS \"asset_kind!\",\n               a.address                AS \"asset_address?\"\n          FROM outbound_transfers t\n          JOIN assets a ON a.id = t.asset_id\n         WHERE t.id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "merchant_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "asset_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "asset_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "token_id?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "token_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "intent!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "intent"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "network_type!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "network_type"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "chain_ref!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "chain_ref"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "from_address!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "from_address"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "from_kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "from_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "authority_role!",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "authority_role"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "authority_index!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "authority_index"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "fee_payer_role?",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "fee_payer_role"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "fee_payer_index?",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "fee_payer_index"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "to_address!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "to_address"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "amount_requested?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 15,
+        "name": "amount_resolved?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 16,
+        "name": "params!",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "params"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "tx_hash?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "tx_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "raw_tx?",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "raw_tx"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "nonce?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "nonce"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "valid_until?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "valid_until"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "fee_estimate?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 22,
+        "name": "asset_kind!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "asset_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "asset_address?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "assets",
+            "name": "address"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      null,
+      null,
+      false,
+      true,
+      true,
+      true,
+      true,
+      null,
+      false,
+      true
+    ]
+  },
+  "hash": "3983abbc9a3008d1baf381a2d1ee2496e6de2588209a5df55b5a60c80b9fd11d"
+}

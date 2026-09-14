@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE outbound_transfers\n           SET status = 'signed', tx_hash = $2, raw_tx = $3,\n               amount_resolved = $4::text::numeric,\n               nonce = $5, valid_until = $6, fee_estimate = $7::text::numeric,\n               claimed_at = NULL, last_error = NULL, updated_at = now()\n         WHERE id = $1 AND status = 'pending'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Bytea",
+        "Text",
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5c7a0a4a4d8d937dd50fa1e91a60845688b0edd291ea82e23e126dcdd6f51fa9"
+}

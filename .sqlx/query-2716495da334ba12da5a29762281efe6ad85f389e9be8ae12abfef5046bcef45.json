@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE outbound_transfers\n           SET status = 'confirmed', block_number = $2, fee_paid = $3::text::numeric,\n               claimed_at = NULL, updated_at = now()\n         WHERE id = $1 AND status = 'broadcast'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2716495da334ba12da5a29762281efe6ad85f389e9be8ae12abfef5046bcef45"
+}

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE payments\n                SET status = 'system_confirmed', confirmations = $2, updated_at = CURRENT_TIMESTAMP\n                WHERE id = $1 AND status IN ('detected', 'merchant_confirmed')\n                RETURNING id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fe9ccaf1841dc3a379384c4177afc276e710ab8f14caa13d5d355d196cb60486"
+}

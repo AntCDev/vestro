@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT i.id, i.merchant_id, i.token_id, i.wallet_address, i.wallet_index,\n                   i.amount_requested, i.required_confirmations\n            FROM invoices i\n            WHERE i.network_type = $1\n              AND i.chain_ref = $2\n              AND i.wallet_address <> ''\n              AND (\n                    (\n                      i.status IN ('pending', 'underpaid', 'paid', 'overpaid')\n                      AND i.expires_at > now() - ($3::int * interval '1 minute')\n                    )\n                    OR EXISTS (\n                      SELECT 1 FROM payments p\n                      WHERE p.invoice_id = i.id\n                        AND p.status IN ('detected', 'merchant_confirmed')\n                    )\n              )\n            ORDER BY i.created_at DESC\n            LIMIT $4\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "merchant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "token_id",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "token_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "wallet_address",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "wallet_address"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "wallet_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "wallet_index"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "amount_requested",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "amount_requested"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "required_confirmations",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "required_confirmations"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9d0c811b02445b563efa0ba214ffb573d29e610a97c57a00cdb2656d62cae268"
+}

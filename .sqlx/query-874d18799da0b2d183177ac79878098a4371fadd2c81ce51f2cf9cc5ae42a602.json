@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO merchant_network_indices (merchant_id, network, role, next_index)\n        VALUES ($1, $2, 0, 1)\n        ON CONFLICT (merchant_id, network, role)\n        DO UPDATE SET next_index = merchant_network_indices.next_index + 1,\n                      updated_at = now()\n        RETURNING next_index\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "merchant_network_indices",
+            "name": "next_index"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "874d18799da0b2d183177ac79878098a4371fadd2c81ce51f2cf9cc5ae42a602"
+}

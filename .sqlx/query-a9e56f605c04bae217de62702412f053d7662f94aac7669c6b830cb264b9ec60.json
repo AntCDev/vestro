@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO outbound_transfers\n            (merchant_id, network_type, chain_ref, asset_id, token_id, intent,\n             from_address, from_kind, authority_role, authority_index, fee_payer_role, fee_payer_index,\n             to_address, amount_requested, params, supersedes)\n        SELECT merchant_id, network_type, chain_ref, asset_id, token_id, intent,\n               from_address, from_kind, authority_role, authority_index, fee_payer_role, fee_payer_index,\n               to_address, amount_requested, params, id\n          FROM outbound_transfers\n         WHERE id = $1\n        RETURNING id AS \"id!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "outbound_transfers",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a9e56f605c04bae217de62702412f053d7662f94aac7669c6b830cb264b9ec60"
+}

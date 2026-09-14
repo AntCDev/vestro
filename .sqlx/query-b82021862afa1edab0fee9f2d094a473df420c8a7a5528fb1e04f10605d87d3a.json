@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address, derivation_path FROM merchant_wallets WHERE merchant_id = $1 AND network_type = $2 AND role = $3 AND wallet_index = $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "merchant_wallets",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "derivation_path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "merchant_wallets",
+            "name": "derivation_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int2",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b82021862afa1edab0fee9f2d094a473df420c8a7a5528fb1e04f10605d87d3a"
+}

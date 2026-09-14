@@ -1,0 +1,162 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT p.id, p.tx_hash, p.amount, p.block_number, p.status,\n                   p.invoice_id, i.merchant_id, i.token_id, i.wallet_address, i.wallet_index,\n                   i.amount_requested, i.required_confirmations\n            FROM payments p\n            JOIN invoices i ON i.id = p.invoice_id\n            WHERE i.network_type = $1\n              AND i.chain_ref = $2\n              AND p.block_number > $3\n              AND p.status <> 'orphaned'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tx_hash",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "tx_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "amount",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "amount"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "block_number",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "block_number"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "invoice_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payments",
+            "name": "invoice_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "merchant_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "merchant_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "token_id",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "token_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "wallet_address",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "wallet_address"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "wallet_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "wallet_index"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "amount_requested",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "amount_requested"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "required_confirmations",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "invoices",
+            "name": "required_confirmations"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "4b14bb77a385e1f8c8d844f891e71f59051e88e19f488615d0f24e8e439a1422"
+}

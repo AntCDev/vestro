@@ -153,14 +153,6 @@ impl TokenHandler for DevnetHandler {
 
 #[async_trait]
 impl Invoicer for DevnetHandler {
-    fn checkout_view(&self) -> CheckoutView {
-        CHECKOUT_VIEW
-    }
-
-    async fn checkout_data(&self, _pool: &PgPool, ctx: &CheckoutContext) -> Result<Value, String> {
-        sol_checkout_data(&self.network, self.config.name, self.config.decimals, ctx)
-    }
-
     async fn create_invoice_payment(
         &self,
         pool: &PgPool,
@@ -249,6 +241,14 @@ impl Invoicer for DevnetHandler {
             self.descriptor.id
         );
         Ok(())
+    }
+
+    fn checkout_view(&self) -> CheckoutView {
+        CHECKOUT_VIEW
+    }
+
+    async fn checkout_data(&self, _pool: &PgPool, ctx: &CheckoutContext) -> Result<Value, String> {
+        sol_checkout_data(&self.network, self.config.name, self.config.decimals, ctx)
     }
 
     async fn presign_data(

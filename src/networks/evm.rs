@@ -444,11 +444,8 @@ impl EVMNetwork {
 
     /// Token address must already be lowercase hex — the Ledgerer looks it up
     /// verbatim. `None` => native.
-    fn asset_for(&self, token_lc: Option<&str>) -> AssetKey {
-        match token_lc {
-            Some(t) => AssetKey::contract(self.chain(), t),
-            None => AssetKey::native(self.chain()),
-        }
+    fn asset_for(&self, token_lc: Option<&str>) -> Result<AssetKey, String> {
+        AssetKey::from_optional_address(self.chain(), token_lc)
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -784,6 +781,7 @@ impl EVMNetwork {
             let Some(invoices) = by_address.get(&t.to_lc) else { continue };
             let amount = wei_to_decimal(t.value)?;
             let (event_index, event_ref) = Self::event_index_value();
+            let asset = self.asset_for(None)?;
 
             let credits: Vec<Credit> = invoices
                 .iter()
@@ -797,7 +795,7 @@ impl EVMNetwork {
                     inv,
                     amount,
                     path: PaymentPath::Direct,
-                    asset: self.asset_for(None),
+                    asset: asset.clone(),
                     event_index,
                     event_ref: event_ref.clone(),
                     from_lc: Some(t.from_lc.clone()),
@@ -865,7 +863,7 @@ impl EVMNetwork {
                     inv,
                     amount,
                     path: PaymentPath::Direct,
-                    asset: self.asset_for(Some(&t.token_lc)),
+                    asset: self.asset_for(Some(&t.token_lc))?,
                     event_index,
                     event_ref: event_ref.clone(),
                     from_lc: Some(t.from_lc.clone()),
@@ -979,7 +977,7 @@ impl EVMNetwork {
             path: PaymentPath::Reference, // identified by invoice id in the log
             // Native invoices arrive tagged address(0) in the event; the asset
             // is the chain's native one, not a contract at the sentinel.
-            asset: self.asset_for(inv.token_lc.as_deref()),
+            asset: self.asset_for(inv.token_lc.as_deref())?,
             event_index,
             event_ref,
             from_lc: Some(ev.payer_lc.clone()),
@@ -2288,6 +2286,36 @@ impl EVMNetwork {
             "Quorum disagreement for {method} on chain {}: endpoints returned different values: {:?}",
             self.chain_id, oks
         ))
+    }
+
+    /// Sequential fallback. For writes and for reads about *our own* tx, quorum
+    /// is wrong: two nodes disagreeing about whether they've seen a tx we just
+    /// sent is normal for a few seconds.
+    async fn call_rpc_fallback(&self, method: &'static str, params: serde_json::Value)
+                               -> Result<serde_json::Value, String> {
+        let mut errs = Vec::new();
+        for url in &self.rpc_urls {
+            match self.call_rpc_single_json(url, method, params.clone()).await {
+                Ok(v) => return Ok(v),
+                Err(e) => errs.push(e),
+            }
+        }
+        Err(format!("all endpoints failed for {method}: {errs:?}"))
+    }
+
+    /// Nonce is a DB fact, not an RPC fact. Seeded from the chain on first use.
+    async fn allocate_nonce(&self, pool: &PgPool, address: &str) -> Result<u64, String> {
+        let on_chain = self.call_rpc("eth_getTransactionCount", json!([address, "pending"])).await?;
+        let seed = u64::from_str_radix(on_chain.trim_start_matches("0x"), 16).map_err(|e| e.to_string())?;
+        let n: i64 = sqlx::query_scalar(r#"
+            INSERT INTO chain_nonces (address, network_type, chain_ref, next_nonce)
+            VALUES ($1, $2, $3, $4 + 1)
+            ON CONFLICT (address, network_type, chain_ref) DO UPDATE
+               SET next_nonce = GREATEST(chain_nonces.next_nonce, $4) + 1, updated_at = now()
+            RETURNING next_nonce - 1"#)
+            .bind(address).bind(self.network_type()).bind(self.chain_ref()).bind(seed as i64)
+            .fetch_one(pool).await.map_err(|e| e.to_string())?;
+        Ok(n as u64)
     }
 
     /// Same idea as `call_rpc`, but for methods whose `result` is a JSON

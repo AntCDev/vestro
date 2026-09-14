@@ -614,11 +614,8 @@ impl SolanaNetwork {
         (idx, r)
     }
 
-    fn asset_for(&self, mint: Option<&str>) -> AssetKey {
-        match mint {
-            Some(m) => AssetKey::contract(self.chain(), m),
-            None => AssetKey::native(self.chain()),
-        }
+    fn asset_for(&self, mint: Option<&str>) -> Result<AssetKey, String> {
+        AssetKey::from_optional_address(self.chain(), mint)
     }
 
     /// LEDGER.md §2.8. The key that can sign a sweep. NOT `wallet_address`:

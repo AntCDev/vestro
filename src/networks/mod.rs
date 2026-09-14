@@ -16,10 +16,13 @@ use argon2::{
 use sha2::{Digest};
 use crate::keys::crypto::decrypt_data;
 use crate::keys::derivation::{DerivationScheme, DerivedAddress, KeyRole, WalletSpec, MAIN_WALLET};
+use crate::networks::transfers::{SignedTransfer, TransferRequest, TransferStatus};
 
 pub mod evm;
 pub mod sol;
 pub mod esplora;
+pub mod transfers;
+pub mod outbound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SolanaCluster {
@@ -175,6 +178,7 @@ impl NetworkRegistry {
         for (chain_id, network) in &self.evm {
             let (network, pool, chain_id) = (network.clone(), pool.clone(), *chain_id);
             tokio::spawn(async move {
+                outbound::spawn(pool.clone(), network.clone() as Arc<dyn NetworkClient>);
                 if let Err(err) = network.spin_up(&pool).await {
                     eprintln!("❌ EVM network (chain {chain_id}) spin_up failed: {err}");
                 }
@@ -184,6 +188,7 @@ impl NetworkRegistry {
         for (cluster, network) in &self.sol {
             let (network, pool, cluster) = (network.clone(), pool.clone(), *cluster);
             tokio::spawn(async move {
+                outbound::spawn(pool.clone(), network.clone() as Arc<dyn NetworkClient>);
                 if let Err(err) = network.spin_up(&pool).await {
                     eprintln!("❌ Solana network ({cluster:?}) spin_up failed: {err}");
                 }
@@ -194,6 +199,7 @@ impl NetworkRegistry {
             let (network, pool, bitcoin_network) =
                 (network.clone(), pool.clone(), *bitcoin_network);
             tokio::spawn(async move {
+                outbound::spawn(pool.clone(), network.clone() as Arc<dyn NetworkClient>);
                 if let Err(err) = network.spin_up(&pool).await {
                     eprintln!("❌ Bitcoin network ({bitcoin_network:?}) spin_up failed: {err}");
                 }
@@ -297,6 +303,17 @@ pub trait NetworkClient: Send + Sync {
         decimals: u8,
     ) -> Result<Amount, String>;
     async fn get_current_block(&self) -> Result<u64, String>;
+
+    // ── Outbound ──────────────────────────────────────────────────────────
+    /// Derive keys, resolve `Max`, allocate sequence, sign. No broadcast.
+    /// `pool` is for sequence allocation only (chain_nonces).
+    async fn build_and_sign(&self, pool: &PgPool, mnemonic: &str, req: &TransferRequest)
+                            -> Result<SignedTransfer, String>;
+    /// Idempotent, repeatable. "already known" is success.
+    async fn broadcast(&self, signed: &SignedTransfer) -> Result<(), String>;
+    async fn transfer_status(&self, signed: &SignedTransfer) -> Result<TransferStatus, String>;
+    fn outbound_poll_interval(&self) -> std::time::Duration { std::time::Duration::from_secs(10) }
+
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String>;
 }
 

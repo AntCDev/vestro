@@ -16,23 +16,22 @@ use serde_json::{json, Value};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+/// `ChainRef`, `AssetKind` and `AssetKey` used to be declared in this file as
+/// well as in `crate::assets`, which meant two incompatible spellings of the
+/// same identity and a `From` impl waiting to happen. There is now one set, and
+/// it lives next to `canonical_address` and the registry that writes the rows
+/// these lookups read.
+///
+/// One rule survives the move: the Ledgerer **looks assets up, it does not
+/// normalise them**. It cannot know the address rules of a network it has never
+/// seen. Build keys with `AssetKey::native` / `AssetKey::contract_canonical`
+/// from values the connector already canonicalized; `AssetKey::contract` (which
+/// does normalise) is for config and RPC input, upstream of here.
+pub use crate::assets::{AssetKey, AssetKind, ChainRef};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Vocabulary
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Which chain. `chain_ref` must be whatever the network client's
-/// `chain_ref()` returned — never a literal (LEDGER.md §1.1).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ChainRef {
-    pub network_type: String,
-    pub chain_ref: String,
-}
-
-impl ChainRef {
-    pub fn new(network_type: impl Into<String>, chain_ref: impl Into<String>) -> Self {
-        Self { network_type: network_type.into(), chain_ref: chain_ref.into() }
-    }
-}
 
 /// How strong "final" is on this chain. Decides whether `orphan()` may write a
 /// reversal journal or must raise (LEDGER.md §5.1).
@@ -43,42 +42,6 @@ pub enum Finality {
     Absolute,
     /// N confirmations is a probability. Reversals are a live path.
     Probabilistic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AssetKind {
-    Native,
-    Contract,
-}
-
-impl AssetKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AssetKind::Native => "native",
-            AssetKind::Contract => "contract",
-        }
-    }
-}
-
-/// Identity of an asset, mirroring `assets_identity`. `address` is `None` iff
-/// `kind == Native`. The address must already be canonical (lowercase hex for
-/// EVM, validated base58 for Solana) — the Ledgerer looks it up, it does not
-/// normalise it, because it cannot know the rules for a network it has never
-/// seen.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AssetKey {
-    pub chain: ChainRef,
-    pub kind: AssetKind,
-    pub address: Option<String>,
-}
-
-impl AssetKey {
-    pub fn native(chain: ChainRef) -> Self {
-        Self { chain, kind: AssetKind::Native, address: None }
-    }
-    pub fn contract(chain: ChainRef, address: impl Into<String>) -> Self {
-        Self { chain, kind: AssetKind::Contract, address: Some(address.into()) }
-    }
 }
 
 /// `chain_movements.from_kind` / `to_kind`. Classifies the ADDRESS, not the
@@ -198,8 +161,10 @@ pub struct ObservedInbound {
 }
 
 /// Where recognized value physically sits and who can sign for it
-/// (LEDGER.md §2.8). Only needed for `PaymentPath::Direct`.
-/// Only needed when the value landed in custody_unswept (deposit address or vault). and MissingCustody Display: "payment {payment_id} landed in custody_unswept but no Custody was supplied".
+/// (LEDGER.md §2.8). Only needed when the value landed in `custody_unswept` —
+/// i.e. at a deposit address or a vault — because that is the only case with a
+/// sweep to enqueue. A `Reference`-path payment straight into the merchant's
+/// own account needs none.
 #[derive(Debug, Clone)]
 pub struct Custody {
     pub address: String,
@@ -269,13 +234,17 @@ pub enum OrphanOutcome {
 pub enum LedgerError {
     Db(sqlx::Error),
     UnknownAsset(AssetKey),
+    /// An `assets` row carries an `asset_kind` that is neither `native` nor
+    /// `contract`. The CHECK constraint is gone or a migration lied.
+    UnreadableAssetKind { asset: AssetKey, kind: String },
     /// The payment has no movement attached to this tx. Detection never
     /// called `record_detected`, or called it without a payment_id.
     NoMovementForPayment { payment_id: Uuid, tx_hash: String },
     /// Movements for one payment named more than one asset. One invoice, one
     /// asset — this is a classifier bug, not a ledger case.
     MixedAssets { payment_id: Uuid },
-    /// `PaymentPath::Direct` without `Custody`: nowhere to enqueue the sweep.
+    /// Value landed in `custody_unswept` but no `Custody` came with it, so
+    /// there is nowhere to enqueue the sweep.
     MissingCustody { payment_id: Uuid },
     /// A recognized journal exists on a chain whose finality is absolute.
     /// The confirmation ladder is wrong or an RPC lied. Alarm, don't reverse.
@@ -285,23 +254,21 @@ pub enum LedgerError {
     SweepInFlight { payment_id: Uuid, rows: i64 },
     /// Movements for one payment landed at more than one kind of address.
     MixedCustody { payment_id: Uuid },
-    /// The movement's `to_kind` has no custody account (external/operator/NULL).
-    /// The connector classified the destination wrong.
-    NoCustodyAccount { payment_id: Uuid, to_kind: Option<String> },
+    /// An address kind has no custody account (external/operator/NULL). The
+    /// connector classified it wrong. `subject` is the payment on the inbound
+    /// path and the transfer on the outbound one — both are "the thing whose
+    /// value we cannot book".
+    NoCustodyAccount { subject: Uuid, kind: Option<String> },
 }
 
 impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LedgerError::Db(e) => write!(f, "ledger db error: {e}"),
-            LedgerError::UnknownAsset(k) => write!(
-                f,
-                "asset not registered: {}/{}/{}/{}",
-                k.chain.network_type,
-                k.chain.chain_ref,
-                k.kind.as_str(),
-                k.address.as_deref().unwrap_or("-")
-            ),
+            LedgerError::UnknownAsset(k) => write!(f, "asset not registered: {k}"),
+            LedgerError::UnreadableAssetKind { asset, kind } => {
+                write!(f, "asset {asset} has unreadable asset_kind {kind:?}")
+            }
             LedgerError::NoMovementForPayment { payment_id, tx_hash } => write!(
                 f,
                 "payment {payment_id} has no chain_movement on tx {tx_hash}; was record_detected called?"
@@ -309,9 +276,10 @@ impl std::fmt::Display for LedgerError {
             LedgerError::MixedAssets { payment_id } => {
                 write!(f, "payment {payment_id} movements span more than one asset")
             }
-            LedgerError::MissingCustody { payment_id } => {
-                write!(f, "payment {payment_id} is direct-path but no Custody was supplied")
-            }
+            LedgerError::MissingCustody { payment_id } => write!(
+                f,
+                "payment {payment_id} landed in custody_unswept but no Custody was supplied"
+            ),
             LedgerError::ImpossibleReversal { payment_id, journal_id } => write!(
                 f,
                 "ALARM: payment {payment_id} orphaned on an absolute-finality chain but journal {journal_id} already exists"
@@ -323,9 +291,9 @@ impl std::fmt::Display for LedgerError {
             LedgerError::MixedCustody { payment_id } => {
                 write!(f, "payment {payment_id} movements landed at more than one address kind")
             }
-            LedgerError::NoCustodyAccount { payment_id, to_kind } => write!(
+            LedgerError::NoCustodyAccount { subject, kind } => write!(
                 f,
-                "payment {payment_id} landed at to_kind {to_kind:?}, which has no custody account"
+                "{subject} touched address kind {kind:?}, which has no custody account"
             ),
         }
     }
@@ -358,7 +326,9 @@ pub struct Ledgerer;
 #[derive(Debug, Clone)]
 struct AssetRow {
     id: Uuid,
-    kind: String,
+    #[allow(dead_code)]
+    kind: AssetKind,
+    #[allow(dead_code)]
     registered: bool,
 }
 
@@ -374,6 +344,29 @@ struct MovementRow {
 struct FeeRate {
     bps: i32,
     source: &'static str,
+}
+
+/// A transfer *we* initiated landed. Books the settlement half (LEDGER.md §7).
+#[derive(Debug, Clone)]
+pub struct OutboundSettled {
+    pub transfer_id: Uuid,
+    pub merchant_id: Uuid,
+    pub intent: String,
+    pub token_id: Option<String>,
+    pub chain: ChainRef,
+    pub asset: AssetKey,
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub from_address: String,
+    pub from_kind: AddressKind,
+    pub to_address: String,
+    pub to_kind: AddressKind,
+    pub amount: Decimal,
+    /// In the chain's native asset.
+    pub fee_paid: Decimal,
+    /// Which custody account the fee came out of: Gas (fee payer model) or
+    /// the source address's own native balance (self-funded).
+    pub fee_from_kind: AddressKind,
 }
 
 impl Ledgerer {
@@ -546,8 +539,6 @@ impl Ledgerer {
         }
         let amount: Decimal = movements.iter().map(|m| m.amount).sum();
 
-
-
         // 3. Custody account: where does the value physically sit? Decided by
         //    the movement's to_kind, never by payment_path. A vault Payment log
         //    and a deposit-address transfer are both "unswept" — the vault
@@ -562,8 +553,8 @@ impl Ledgerer {
             .and_then(AddressKind::from_db)
             .and_then(AddressKind::custody_account)
             .ok_or_else(|| LedgerError::NoCustodyAccount {
-                payment_id: input.payment_id,
-                to_kind: to_kind.map(str::to_owned),
+                subject: input.payment_id,
+                kind: to_kind.map(str::to_owned),
             })?;
 
         let asset_registered: bool =
@@ -583,7 +574,6 @@ impl Ledgerer {
         if enqueue && input.custody.is_none() {
             return Err(LedgerError::MissingCustody { payment_id: input.payment_id });
         }
-
 
         // 4. Fee rate, resolved at occurred_at, snapshotted into metadata.
         let (occurred_at, exact) = match block_time {
@@ -791,6 +781,79 @@ impl Ledgerer {
         Ok(OrphanOutcome::Reversed { tx_id, reversal_journal_id: reversal_id })
     }
 
+    // ── Write point 5: outbound settlement ──────────────────────────────────
+
+    /// chain_transactions row with intent = sweep/…, status final; one
+    /// movement for the value, one for the fee; one `sweep_settled` journal:
+    ///   custody_<from>  -amount      custody_<to>  +amount
+    ///   custody_<fee>   -fee (native) gas_expense  +fee (native)
+    /// Idempotent on `sweep_settled:<transfer_id>`.
+    pub async fn record_outbound(&self, conn: &mut PgConnection, s: &OutboundSettled) -> LedgerResult<Uuid> {
+        let tx_id: Uuid = sqlx::query_scalar(r#"
+            INSERT INTO chain_transactions
+                (network_type, chain_ref, tx_hash, intent, merchant_id, token_id, block_number, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'final')
+            ON CONFLICT (network_type, chain_ref, tx_hash) DO UPDATE
+               SET status='final', block_number=EXCLUDED.block_number
+            RETURNING id"#)
+            .bind(&s.chain.network_type).bind(&s.chain.chain_ref).bind(&s.tx_hash)
+            .bind(&s.intent).bind(s.merchant_id).bind(&s.token_id).bind(s.block_number)
+            .fetch_one(&mut *conn).await?;
+
+        let asset = self.find_asset(conn, &s.asset).await?;
+        // `s.asset.chain` and `s.chain` are now the same type; the native asset
+        // of the chain the transfer happened on is the one the fee is paid in.
+        let native = self.find_asset(conn, &AssetKey::native(s.chain.clone())).await?;
+
+        let mut mv = |idx: i32, asset_id: Uuid, amt: Decimal, from: &str, fk: AddressKind, to: &str, tk: AddressKind| {
+            sqlx::query(r#"
+                INSERT INTO chain_movements
+                    (tx_id, network_type, chain_ref, event_index, event_ref, merchant_id,
+                     asset_id, token_id, amount, from_address, from_kind, to_address, to_kind)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                ON CONFLICT (tx_id, event_index) DO NOTHING"#)
+                .bind(tx_id).bind(&s.chain.network_type).bind(&s.chain.chain_ref)
+                .bind(idx).bind(format!("outbound:{idx}")).bind(s.merchant_id)
+                .bind(asset_id).bind(&s.token_id).bind(amt)
+                .bind(from.to_string()).bind(fk.as_str()).bind(to.to_string()).bind(tk.as_str())
+        };
+        mv(0, asset.id, s.amount, &s.from_address, s.from_kind, &s.to_address, s.to_kind)
+            .execute(&mut *conn).await?;
+        if s.fee_paid > Decimal::ZERO {
+            // Fee "destination" is the chain itself; recorded as external.
+            mv(1, native.id, s.fee_paid, &s.from_address, s.fee_from_kind, "", AddressKind::External)
+                .execute(&mut *conn).await?;
+        }
+
+        let Some(journal_id) = self.insert_journal(conn, "sweep_settled",
+                                                   &format!("sweep_settled:{}", s.transfer_id),
+                                                   Some(s.merchant_id), Some(tx_id), None, None,
+                                                   json!({ "intent": s.intent, "transfer_id": s.transfer_id, "token_id": s.token_id }),
+                                                   Utc::now()).await?
+        else {
+            return Ok(tx_id); // latch held
+        };
+
+        let from_acct = s.from_kind.custody_account()
+            .ok_or(LedgerError::NoCustodyAccount { subject: s.transfer_id, kind: Some(s.from_kind.as_str().into()) })?;
+        let to_acct = s.to_kind.custody_account()
+            .ok_or(LedgerError::NoCustodyAccount { subject: s.transfer_id, kind: Some(s.to_kind.as_str().into()) })?;
+
+        let a_from = self.account(conn, Some(s.merchant_id), from_acct, asset.id).await?;
+        let a_to = self.account(conn, Some(s.merchant_id), to_acct, asset.id).await?;
+        self.post(conn, journal_id, a_from, asset.id, -s.amount).await?;
+        self.post(conn, journal_id, a_to, asset.id, s.amount).await?;
+
+        if s.fee_paid > Decimal::ZERO {
+            let fee_acct = s.fee_from_kind.custody_account().unwrap_or("custody_gas");
+            let a_fee = self.account(conn, Some(s.merchant_id), fee_acct, native.id).await?;
+            let a_exp = self.account(conn, Some(s.merchant_id), "gas_expense", native.id).await?;
+            self.post(conn, journal_id, a_fee, native.id, -s.fee_paid).await?;
+            self.post(conn, journal_id, a_exp, native.id, s.fee_paid).await?;
+        }
+        Ok(tx_id)
+    }
+
     // ── Reversal ────────────────────────────────────────────────────────────
 
     /// Write the exact negation of `original`. The deferred trigger proves it
@@ -854,6 +917,9 @@ impl Ledgerer {
     /// Look up an asset by identity. Errors if unknown: for the payment path
     /// the asset must have a handler and therefore a row. Reconciliation uses
     /// `ensure_observed_asset` instead.
+    ///
+    /// `key.address` is used verbatim. Canonicalization belongs to
+    /// `crate::assets::canonical_address`, upstream of every caller here.
     async fn find_asset(&self, conn: &mut PgConnection, key: &AssetKey) -> LedgerResult<AssetRow> {
         let row = sqlx::query(
             r#"
@@ -871,9 +937,15 @@ impl Ledgerer {
             .await?
             .ok_or_else(|| LedgerError::UnknownAsset(key.clone()))?;
 
+        let kind_str: String = row.get("asset_kind");
+        let kind = AssetKind::from_db(&kind_str).ok_or_else(|| LedgerError::UnreadableAssetKind {
+            asset: key.clone(),
+            kind: kind_str,
+        })?;
+
         Ok(AssetRow {
             id: row.get("id"),
-            kind: row.get("asset_kind"),
+            kind,
             registered: row.get("registered"),
         })
     }
@@ -881,6 +953,10 @@ impl Ledgerer {
     /// For reconciliation (LEDGER.md §3.1): an asset nobody registered.
     /// decimals = 0, symbol = 'UNKNOWN', registered = false. Never overwrites
     /// an existing row.
+    ///
+    /// Conflict target is `assets_identity` by name, matching
+    /// `crate::assets::upsert_registered`. A column-list target would not
+    /// collide on native rows, whose `address` is NULL.
     pub async fn ensure_observed_asset(
         &self,
         conn: &mut PgConnection,
@@ -892,7 +968,7 @@ impl Ledgerer {
             INSERT INTO assets
                 (network_type, chain_ref, asset_kind, address, decimals, symbol, asset_params, registered)
             VALUES ($1, $2, $3, $4, 0, 'UNKNOWN', $5, false)
-            ON CONFLICT (network_type, chain_ref, asset_kind, address) DO NOTHING
+            ON CONFLICT ON CONSTRAINT assets_identity DO NOTHING
             "#,
         )
             .bind(&key.chain.network_type)

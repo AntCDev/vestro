@@ -1,55 +1,47 @@
-//! The *sweep* capability. DUMMY — the trait and its types exist so the
-//! registry can index sweep-capable handlers and the frontend can render the
-//! capability badge. Nothing implements it yet.
-//!
-//! Shape note: a sweep is requested against an **asset**, not a token ID. The
-//! ledger says "merchant M holds 50 of evm/8453/0xa0b8…", asks the registry
-//! which handlers advertise that asset *and* can sweep, and then either calls
-//! the only one or asks the operator to choose. The token ID never enters the
-//! ledger.
+//! The *sweep* capability. A sweeper does not move value. It finishes the
+//! orchestrator's draft into a concrete TransferPlan; the network worker does
+//! the moving. That keeps handlers stateless and keys out of this layer.
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::assets::AssetKey;
+use crate::ledgerer::{AddressKind, AssetKey};
+use crate::networks::transfers::{SignerRef, SourceAccount, TransferAmount};
 
+/// What the orchestrator knows before asking the handler.
 #[derive(Clone, Debug)]
-pub struct SweepRequest {
+pub struct SweepDraft {
     pub merchant_id: Uuid,
-    /// What to move. Must match the handler's advertised asset.
     pub asset: AssetKey,
-    /// Base units, as the ledger holds them.
-    pub amount: Decimal,
-    /// Which derived deposit address to sweep from. `None` means "the handler
-    /// decides" — e.g. consolidate every funded index it knows about.
-    pub from_wallet_index: Option<u32>,
-    /// Override the merchant's configured treasury address.
-    pub destination: Option<String>,
+    pub asset_id: Uuid,
+    pub custody_address: String,
+    pub custody_kind: AddressKind,
+    pub authority_address: String,
+    pub authority: SignerRef,
+    /// Merchant main wallet on this family, already looked up.
+    pub destination: String,
+    /// Sum of the pending sweep rows being grouped. Informational — most
+    /// sweepers will still return `Max`.
+    pub queued_total: Decimal,
+    pub movement_count: usize,
+    /// Merged `sweep_queue.sweep_params` of the grouped rows.
+    pub sweep_params: Value,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct SweepOutcome {
-    /// Chain-shaped transaction identifier: EVM tx hash, Solana signature, txid.
-    pub tx_ref: String,
-    pub swept: Decimal,
-    /// In the chain's *native* asset, not in `asset`. `None` if unknown at
-    /// broadcast time.
-    pub fee_paid: Option<Decimal>,
+/// What the handler hands back. Persisted verbatim into outbound_transfers.
+#[derive(Clone, Debug)]
+pub struct TransferPlan {
+    pub from: SourceAccount,
+    pub to: String,
+    pub amount: TransferAmount,
+    pub fee_payer: Option<SignerRef>,
+    pub params: Value,
 }
 
 #[async_trait]
 pub trait Sweeper: Send + Sync {
-    async fn sweep(&self, pool: &PgPool, req: &SweepRequest) -> Result<SweepOutcome, String>;
-
-    /// Lets the UI show "sweeping costs ~X" and lets a planner skip dust.
-    async fn estimate_fee(
-        &self,
-        _pool: &PgPool,
-        _req: &SweepRequest,
-    ) -> Result<Option<Decimal>, String> {
-        Ok(None)
-    }
+    async fn plan(&self, pool: &PgPool, draft: &SweepDraft) -> Result<TransferPlan, String>;
 }

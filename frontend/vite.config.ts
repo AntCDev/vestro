@@ -16,6 +16,7 @@ export default defineConfig({
         ledger: resolve(__dirname, 'ledger.html'),
         new_invoice: resolve(__dirname, 'new-invoice.html'),
         invoices: resolve(__dirname, 'invoices.html'),
+        sweeps: resolve(__dirname, 'sweeps.html'),
         checkoutSol: resolve(__dirname, 'checkout/SOL.html'),
         checkoutEvm: resolve(__dirname, 'checkout/EVM.html'),
       },

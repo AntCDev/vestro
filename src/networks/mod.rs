@@ -179,6 +179,10 @@ impl NetworkRegistry {
         for (chain_id, network) in &self.evm {
             let (network, pool, chain_id) = (network.clone(), pool.clone(), *chain_id);
             tokio::spawn(async move {
+                if let Err(err) = network.preflight(&pool).await {
+                    eprintln!("❌ EVM network (chain {chain_id}) preflight failed: {err} — not starting");
+                    return;
+                }
                 outbound::spawn(pool.clone(), network.clone() as Arc<dyn NetworkClient>);
                 if let Err(err) = network.spin_up(&pool).await {
                     eprintln!("❌ EVM network (chain {chain_id}) spin_up failed: {err}");
@@ -189,6 +193,10 @@ impl NetworkRegistry {
         for (cluster, network) in &self.sol {
             let (network, pool, cluster) = (network.clone(), pool.clone(), *cluster);
             tokio::spawn(async move {
+                if let Err(err) = network.preflight(&pool).await {
+                    eprintln!("❌ Solana network ({cluster:?}) preflight failed: {err} — not starting");
+                    return;
+                }
                 outbound::spawn(pool.clone(), network.clone() as Arc<dyn NetworkClient>);
                 if let Err(err) = network.spin_up(&pool).await {
                     eprintln!("❌ Solana network ({cluster:?}) spin_up failed: {err}");
@@ -200,13 +208,17 @@ impl NetworkRegistry {
             let (network, pool, bitcoin_network) =
                 (network.clone(), pool.clone(), *bitcoin_network);
             tokio::spawn(async move {
+                if let Err(err) = network.preflight(&pool).await {
+                    eprintln!("❌ Bitcoin network ({bitcoin_network:?}) preflight failed: {err} — not starting");
+                    return;
+                }
                 outbound::spawn(pool.clone(), network.clone() as Arc<dyn NetworkClient>);
                 if let Err(err) = network.spin_up(&pool).await {
                     eprintln!("❌ Bitcoin network ({bitcoin_network:?}) spin_up failed: {err}");
                 }
             });
         }
-    }    
+    }
     
     pub fn evm_chain(&self, chain_id: u64) -> Option<Arc<evm::EVMNetwork>> {
         self.evm.get(&chain_id).cloned()
@@ -315,6 +327,7 @@ pub trait NetworkClient: Send + Sync {
     async fn transfer_status(&self, signed: &SignedTransfer) -> Result<TransferStatus, String>;
     fn outbound_poll_interval(&self) -> std::time::Duration { std::time::Duration::from_secs(10) }
 
+    async fn preflight(&self, pool: &PgPool) -> Result<(), String>;
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String>;
 }
 

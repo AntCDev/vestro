@@ -2318,6 +2318,7 @@ impl SolanaNetwork {
               LEFT JOIN merchant_wallets mw
                      ON mw.merchant_id = i.merchant_id
                     AND mw.network_type = $1
+                    AND mw.network_type = $4
              WHERE i.network_type = $1
                AND i.chain_ref = $2
                AND i.wallet_address IS NOT NULL
@@ -2337,6 +2338,7 @@ impl SolanaNetwork {
             .bind(NETWORK_TYPE)
             .bind(self.chain_ref())
             .bind(MAX_WATCHED_INVOICES)
+            .bind(purpose::MAIN)
             .fetch_all(pool)
             .await
             .map_err(|e| format!("load_watched_invoices: {e}"))?;
@@ -2874,14 +2876,17 @@ impl NetworkClient for SolanaNetwork {
         Ok(derived)
     }
 
+    async fn preflight(&self, pool: &PgPool) -> Result<(), String> {
+        assert_scheme(pool, &self.derivation_scheme()).await?;
+        ensure_merchant_wallets(pool, self).await?;
+        Ok(())
+    }
+
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
         println!(
             "SolanaNetwork::spin_up initializing for {} ({}/{})",
             self.network_name, NETWORK_TYPE, self.chain_ref()
         );
-
-        assert_scheme(pool, &self.derivation_scheme()).await?;
-        ensure_merchant_wallets(pool, self).await?;
 
         self.watch_addresses(pool).await
     }

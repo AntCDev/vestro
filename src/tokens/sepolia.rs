@@ -148,20 +148,64 @@ impl TokenHandler for SepoliaHandler {
 impl Sweeper for SepoliaHandler {
     async fn plan(&self, _pool: &PgPool, d: &SweepDraft) -> Result<TransferPlan, String> {
         match d.custody_kind {
-            AddressKind::DepositAddress => {}
-            AddressKind::Vault => return Err("vault sweeps not implemented — see Phase 5 vault model".into()),
-            k => return Err(format!("cannot sweep from {k:?}")),
+            AddressKind::DepositAddress => Ok(TransferPlan {
+                from: SourceAccount {
+                    address: d.custody_address.clone(),
+                    kind: d.custody_kind,
+                    authority: d.authority,
+                },
+                to: d.destination.clone(),
+                amount: TransferAmount::Max,
+                fee_payer: None,
+                params: json!({}),
+            }),
+
+            AddressKind::Vault => {
+                let vault = self
+                    .network
+                    .vault_address()
+                    .map(str::to_lowercase)
+                    .ok_or("vault sweep but no contract_address configured for this chain")?;
+
+                if d.custody_address.to_lowercase() != vault {
+                    return Err(format!(
+                        "sweep row custody_address {} is not the configured vault {vault}",
+                        d.custody_address
+                    ));
+                }
+                // sweep(token) transfers to msg.sender. A destination that isn't
+                // the signer cannot be honoured by this contract.
+                if d.destination.to_lowercase() != d.authority_address.to_lowercase() {
+                    return Err(format!(
+                        "vault sweep pays its caller: destination {} != authority {}",
+                        d.destination, d.authority_address
+                    ));
+                }
+
+                Ok(TransferPlan {
+                    from: SourceAccount {
+                        address: vault.clone(),
+                        kind: AddressKind::Vault,
+                        authority: d.authority,
+                    },
+                    to: d.destination.clone(),
+                    // The queue row's amount is the confirmed figure. Max only as an
+                    // operator escape hatch — it takes everything, confirmed or not.
+                    amount: d.amount,
+                    fee_payer: None,
+                    params: json!({
+                        "mechanism": "vault_sweep",
+                        "vault": vault,
+                        "token": self.descriptor.asset.key.address,
+                        "authority_address": d.authority_address.to_lowercase(),
+                    }),
+                })
+            }
+
+            k => Err(format!("cannot sweep from {k:?}")),
         }
-        Ok(TransferPlan {
-            from: SourceAccount { address: d.custody_address.clone(), kind: d.custody_kind, authority: d.authority },
-            to: d.destination.clone(),
-            amount: TransferAmount::Max,
-            fee_payer: None, // SelfFunded: deposit address pays its own gas
-            params: json!({}),
-        })
     }
 }
-
 
 #[async_trait]
 impl Invoicer for SepoliaHandler {

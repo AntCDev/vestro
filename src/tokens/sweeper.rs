@@ -23,9 +23,10 @@ pub struct SweepDraft {
     pub authority: SignerRef,
     /// Merchant main wallet on this family, already looked up.
     pub destination: String,
-    /// Sum of the pending sweep rows being grouped. Informational — most
-    /// sweepers will still return `Max`.
+
+    /// Sum of the pending sweep rows being grouped. Informational
     pub queued_total: Decimal,
+    pub amount: TransferAmount,
     pub movement_count: usize,
     /// Merged `sweep_queue.sweep_params` of the grouped rows.
     pub sweep_params: Value,

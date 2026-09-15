@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use rust_decimal::Decimal;
 
 use chrono::{DateTime, Utc};
-use crate::keys::derivation::{DerivationScheme, DerivedAddress, KeyRole, WalletSpec, GAS_FEEDER_WALLET, MAIN_WALLET, SCHEME_VERSION};
+use crate::keys::derivation::{purpose, DerivationScheme, DerivedAddress, KeyRole, WalletSpec, GAS_FEEDER_WALLET, MAIN_WALLET, SCHEME_VERSION};
 use crate::keys::store::assert_scheme;
 use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets};
 use crate::ledgerer::{
@@ -27,7 +27,6 @@ use crate::ledgerer::{
     ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
 };
 use crate::networks::transfers::{SignedTransfer, TransferAmount, TransferRequest, TransferStatus};
-
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
 // ==========================================
@@ -1219,6 +1218,7 @@ impl EVMNetwork {
       JOIN merchant_wallets mw
         ON mw.merchant_id  = i.merchant_id
        AND mw.network_type = $1
+       AND mw.purpose      = $4
      WHERE i.network_type = $1
        AND i.chain_ref   = $2
        AND (
@@ -1232,6 +1232,7 @@ impl EVMNetwork {
             .bind(NETWORK_TYPE)
             .bind(self.chain_ref())
             .bind(FINAL_CONFIRMATIONS)
+            .bind(purpose::MAIN)
             .fetch_all(pool)
             .await
             .map_err(|e| format!("load_watched_invoices: {e}"))?;
@@ -1721,7 +1722,7 @@ impl EVMNetwork {
                 let ctx = sqlx::query(
                     r#"
                     SELECT i.merchant_id, i.token_id, lower(i.wallet_address) AS wallet_address,
-                           i.wallet_index, p.payment_path,
+                           i.wallet_index, i.wallet_role, p.payment_path,
                            m.token_address, m.asset_params, m.to_kind
                       FROM payments p
                       JOIN invoices i ON i.id = p.invoice_id
@@ -1744,6 +1745,7 @@ impl EVMNetwork {
                 let token_id: String = ctx.get("token_id");
                 let wallet_address: String = ctx.get("wallet_address");
                 let wallet_index: Option<i32> = ctx.get("wallet_index");
+                let wallet_role: i16 = ctx.get::<Option<i16>, _>("wallet_role").unwrap_or(KeyRole::Deposit.as_i16());
                 let path_str: Option<String> = ctx.get("payment_path");
                 let token_address: Option<String> = ctx.get("token_address");
 
@@ -1770,7 +1772,7 @@ impl EVMNetwork {
                         address: wallet_address.clone(),
                         kind: AddressKind::DepositAddress,
                         authority_address: wallet_address.clone(),
-                        authority_ref: wallet_index.map(|i| i.to_string()),
+                        authority_ref: wallet_index.map(|i| format!("{wallet_role}:{i}")),
                         sweep_params: json!({
                             "chain_id": self.chain_id,
                             "mechanism": "eoa_transfer",
@@ -1807,7 +1809,11 @@ impl EVMNetwork {
                             address: vault.clone(),
                             kind: AddressKind::Vault,
                             authority_address: merchant_wallet,
-                            authority_ref: Some(0.to_string()),
+                            authority_ref: Some(format!(
+                                "{}:{}",
+                                MAIN_WALLET.role.as_i16(),
+                                MAIN_WALLET.index
+                            )),
                             sweep_params: json!({
                                 "chain_id": self.chain_id,
                                 "mechanism": "vault_sweep",
@@ -2704,6 +2710,103 @@ impl EVMNetwork {
         Ok(())
     }
 
+    async fn vault_balance(&self, vault: &str, merchant20: &[u8; 20], token20: &[u8; 20])
+                           -> Result<u128, String>
+    {
+        let data = vault_balance_calldata(merchant20, token20);
+        let hex = self.call_rpc("eth_call", json!([
+            { "to": vault, "data": format!("0x{}", hex::encode(data)) }, "latest"
+        ])).await?;
+        Ok(Self::parse_hex_balance(&hex)?.0)
+    }
+
+    async fn sign_vault_sweep(
+        &self,
+        pool: &PgPool,
+        key: &k256::ecdsa::SigningKey,
+        signer_lc: &str,
+        req: &TransferRequest,
+    ) -> Result<SignedTransfer, String> {
+        let vault_lc = self.contract_address.as_deref().map(str::to_lowercase)
+            .ok_or("vault sweep on a chain with no contract_address")?;
+        if req.from.address.to_lowercase() != vault_lc {
+            return Err(format!("from_address {} is not the vault {vault_lc}", req.from.address));
+        }
+        // Same guarantee the deposit path gets: the seed must derive the account
+        // the plan named, or we don't sign.
+        if let Some(expected) = req.params.get("authority_address").and_then(|v| v.as_str()) {
+            if expected.to_lowercase() != signer_lc {
+                return Err(format!(
+                    "authority {} derives {signer_lc}, plan says {expected} — refusing to sign",
+                    req.from.authority.to_ref()));
+            }
+        }
+        if req.to.to_lowercase() != signer_lc {
+            return Err(format!("vault sweep pays its caller; to={} signer={signer_lc}", req.to));
+        }
+
+        let vault20  = parse_address(&vault_lc)?;
+        let signer20 = parse_address(signer_lc)?;
+        let token20  = match &req.asset.address {
+            Some(t) => parse_address(t)?,
+            None    => [0u8; 20],   // NATIVE sentinel
+        };
+
+        let onchain = self.vault_balance(&vault_lc, &signer20, &token20).await?;
+
+        let (amount, data) = match req.amount {
+            TransferAmount::Exact(n) => {
+                if n == 0 {
+                    return Err("vault sweep of zero".into());
+                }
+                if n > onchain {
+                    // Would revert with InsufficientBalance. Fail here instead: no gas
+                    // burned, no nonce consumed. Reaching this means the ledger thinks
+                    // more is confirmed than the contract holds — double-counted rows,
+                    // or a sweep that landed without settle() closing its rows.
+                    return Err(format!(
+                        "vault {vault_lc}: plan asks {n} for {signer_lc}, balance is {onchain}"
+                    ));
+                }
+                (n, vault_sweep_amount_calldata(&token20, n))
+            }
+            TransferAmount::Max => {
+                if onchain == 0 {
+                    return Err(format!("vault {vault_lc}: nothing to sweep for {signer_lc}"));
+                }
+                // Pin it. A payment landing before this mines stays for the next sweep
+                // rather than moving under an amount we already recorded.
+                (onchain, vault_sweep_amount_calldata(&token20, onchain))
+            }
+        };
+
+        let (priority, max_fee) = self.fee_params().await?;
+        let gas_limit = self.estimate_gas(signer_lc, &vault_lc, 0, &data).await?;
+
+        // Gas comes from the caller's own balance — even for a native sweep,
+        // because the ETH is still inside the contract until this tx lands.
+        let native = self.get_native_balance(signer_lc).await?.0;
+        let needed = gas_limit as u128 * max_fee;
+        if native < needed {
+            return Err(format!("{signer_lc}: has {native} wei, needs {needed} to call sweep() (gas refill required)"));
+        }
+
+        let nonce = self.allocate_nonce(pool, signer_lc).await?;
+        let tx = Eip1559Tx {
+            chain_id: self.chain_id, nonce, max_priority_fee: priority, max_fee,
+            gas_limit, to: vault20, value: 0, data,
+        };
+        let (raw, tx_hash) = tx.sign(key)?;
+
+        Ok(SignedTransfer {
+            tx_hash, raw, amount,
+            from: signer_lc.to_string(),   // the signer, NOT the vault
+            valid_until: None,
+            nonce: Some(nonce),
+            fee_estimate: Some(gas_limit as u128 * max_fee),
+        })
+    }
+
     async fn fee_params(&self) -> Result<(u128, u128), String> {
         let block = self.call_rpc_json("eth_getBlockByNumber", json!(["latest", false])).await?;
         let base = block["baseFeePerGas"].as_str()
@@ -2811,8 +2914,18 @@ impl NetworkClient for EVMNetwork {
         if req.fee_payer.is_some() {
             return Err("EVM is SelfFunded: fee_payer must be None".into());
         }
-        let (key, derived_addr) = derive_evm_keypair(mnemonic, req.from.authority.role, req.from.authority.index)?;
-        if derived_addr.to_lowercase() != req.from.address.to_lowercase() {
+        let (key, derived_addr) = derive_evm_keypair(
+            mnemonic, req.from.authority.role, req.from.authority.index)?;
+        let derived_lc = derived_addr.to_lowercase();
+
+        // Vault rows name the contract as `from`; the equality check below would
+        // fail by construction, and the balance reads underneath it would return
+        // the pooled balance of every merchant.
+        if req.from.kind == AddressKind::Vault {
+            return self.sign_vault_sweep(pool, &key, &derived_lc, req).await;
+        }
+
+        if derived_lc != req.from.address.to_lowercase() {
             return Err(format!(
                 "authority {} derives {} but from_address is {} — refusing to sign",
                 req.from.authority.to_ref(), derived_addr, req.from.address));
@@ -2919,16 +3032,15 @@ impl NetworkClient for EVMNetwork {
     }
 
     // --- BATCHED WATCHING METHODS ---
+    async fn preflight(&self, pool: &PgPool) -> Result<(), String> {
+        assert_scheme(pool, &self.derivation_scheme()).await?;
+        ensure_merchant_wallets(pool, self).await?;
+        Ok(())
+    }
 
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
         println!("EVMNetwork::spin_up initializing for {} ({})",
                  self.network_name, self.chain_id);
-
-        // 0. Code and DB must agree on the scheme before anything derives.
-        assert_scheme(pool, &self.derivation_scheme()).await?;
-
-        // 1. Main wallet + gas feeder for every merchant missing either.
-        ensure_merchant_wallets(pool, self).await?;
 
         let (addresses_res, logs_res) =
             tokio::join!(self.watch_addresses(pool), self.watch_logs(pool));
@@ -3035,5 +3147,41 @@ pub fn erc20_transfer_calldata(to: &[u8; 20], amount: u128) -> Vec<u8> {
     let mut d = vec![0xa9, 0x05, 0x9c, 0xbb];
     d.extend_from_slice(&[0u8; 12]); d.extend_from_slice(to);
     d.extend_from_slice(&[0u8; 16]); d.extend_from_slice(&amount.to_be_bytes());
+    d
+}
+
+fn selector(sig: &str) -> [u8; 4] {
+    let mut h = Keccak256::new();
+    h.update(sig.as_bytes());
+    let out = h.finalize();
+    [out[0], out[1], out[2], out[3]]
+}
+
+fn vault_sweep_calldata(token20: &[u8; 20]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(36);
+    d.extend_from_slice(&selector("sweep(address)"));
+    d.extend_from_slice(&[0u8; 12]);
+    d.extend_from_slice(token20);
+    d
+}
+
+fn vault_sweep_amount_calldata(token20: &[u8; 20], amount: u128) -> Vec<u8> {
+    let mut d = Vec::with_capacity(68);
+    d.extend_from_slice(&selector("sweepAmount(address,uint256)"));
+    d.extend_from_slice(&[0u8; 12]);
+    d.extend_from_slice(token20);
+    let mut word = [0u8; 32];
+    word[16..].copy_from_slice(&amount.to_be_bytes());  // u128 => right-aligned uint256
+    d.extend_from_slice(&word);
+    d
+}
+
+fn vault_balance_calldata(merchant20: &[u8; 20], token20: &[u8; 20]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(68);
+    d.extend_from_slice(&selector("balanceOf(address,address)"));
+    d.extend_from_slice(&[0u8; 12]);
+    d.extend_from_slice(merchant20);
+    d.extend_from_slice(&[0u8; 12]);
+    d.extend_from_slice(token20);
     d
 }

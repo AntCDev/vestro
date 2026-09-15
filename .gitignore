@@ -21,6 +21,8 @@ pnpm-debug.log*
 .env.*.local
 !.env.example
 
+.todo
+
 # IDE & OS files
 .DS_Store
 /.idea

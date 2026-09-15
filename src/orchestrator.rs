@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::assets::{self, AssetKey, AssetSpec};
 use crate::tokens::handler::TokenHandler;
@@ -273,11 +274,13 @@ impl PaymentOrchestrator {
         let destination = wallet_address(&self.pool, merchant_id, network_type, purpose::MAIN).await?;
 
         // 4. Draft -> handler finishes it.
+        let amount = exact_from_ledger(queued_total)?;
+
         let draft = SweepDraft {
             merchant_id, asset: asset.clone(), asset_id,
             custody_address: custody_address.to_string(), custody_kind,
             authority_address, authority, destination,
-            queued_total, movement_count: rows.len(),
+            queued_total, amount, movement_count: rows.len(),
             sweep_params: Value::Object(params),
         };
         let plan = sweeper.plan(&self.pool, &draft).await?;
@@ -325,4 +328,17 @@ impl PaymentOrchestrator {
     pub fn sweep_candidates(&self, asset: &AssetKey) -> Vec<Arc<dyn TokenHandler>> {
         self.registry.sweepers_for_asset(asset)
     }
+}
+
+fn exact_from_ledger(total: Decimal) -> Result<TransferAmount, String> {
+    let n = total.normalize();            // 2000000000000000.00 -> scale 0
+    if n.scale() != 0 {
+        return Err(format!("sweep total {total} is not whole in base units"));
+    }
+    if n <= Decimal::ZERO {
+        return Err(format!("sweep total {total} is not positive"));
+    }
+    n.to_u128()
+        .map(TransferAmount::Exact)
+        .ok_or_else(|| format!("sweep total {total} does not fit u128"))
 }

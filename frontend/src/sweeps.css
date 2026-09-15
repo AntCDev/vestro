@@ -1,0 +1,129 @@
+/* =============================================================
+   Vestro — sweeps
+   Only the primitives that repeat in rendered markup live here.
+   Everything else is Tailwind utilities on the configured tokens.
+   Prefixed v- so it cannot collide with style.css.
+   ============================================================= */
+
+:root {
+  --paper:  #F1F4F5;
+  --surface:#FAFCFC;
+  --sunken: #E7ECEE;
+  --ink:    #15181A;
+  --muted:  #6B767D;
+  --label:  #5E686E;
+  --faint:  #9CA6AC;
+  --accent: #4E7C8C;
+  --ok:     #4C7D69;
+  --warn:   #9C8250;
+  --stop:   #96635E;
+}
+
+/* --- type ---------------------------------------------------- */
+
+.v-mono {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  font-weight: 300;
+  font-variant-numeric: tabular-nums;
+}
+
+.v-lbl {
+  display: inline-block;
+  font-family: 'Jost', ui-sans-serif, system-ui, sans-serif;
+  font-weight: 300;
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+
+.v-lbl--faint { color: var(--faint); }
+
+/* --- button -------------------------------------------------- */
+
+.v-btn {
+  font-family: 'Jost', ui-sans-serif, system-ui, sans-serif;
+  font-weight: 300;
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--accent);
+  border: 0;
+  border-radius: 0;
+  padding: 11px 16px;
+  cursor: pointer;
+  transition: background-color .15s ease, color .15s ease;
+}
+.v-btn:hover { background: var(--accent); color: var(--surface); }
+
+.v-btn--ghost { color: var(--ink); box-shadow: inset 0 0 0 1px var(--sunken); }
+.v-btn--ghost:hover { background: transparent; color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+
+.v-btn--on { background: var(--accent); color: var(--surface); box-shadow: inset 0 0 0 1px var(--accent); }
+
+.v-btn--sm { padding: 7px 12px; }
+
+.v-btn:disabled { opacity: .4; cursor: not-allowed; }
+.v-btn:disabled:hover { background: transparent; color: var(--accent); }
+.v-btn--ghost:disabled:hover { color: var(--ink); box-shadow: inset 0 0 0 1px var(--sunken); }
+
+/* --- input --------------------------------------------------- */
+
+.v-input {
+  display: block;
+  width: 100%;
+  background: rgba(231, 236, 238, .5);
+  border: 0;
+  border-bottom: 1px solid var(--sunken);
+  border-radius: 0;
+  padding: 10px 12px;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-weight: 300;
+  font-size: 12px;
+  color: var(--ink);
+  transition: border-color .15s ease;
+}
+.v-input::placeholder { color: var(--faint); }
+.v-input:focus { outline: none; border-bottom-color: var(--accent); }
+
+/* --- focus --------------------------------------------------- */
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* --- live region --------------------------------------------- */
+
+/* One per view: the transfer panel, only while the transfer moves. */
+.v-live { box-shadow: 0 0 0 1px rgba(78, 124, 140, .25); }
+
+@keyframes v-breathe { 0%, 100% { opacity: .25 } 50% { opacity: .9 } }
+.v-breathe { animation: v-breathe 3.2s ease-in-out infinite; }
+
+@keyframes v-reveal { from { opacity: 0; transform: translateY(2px) } to { opacity: 1; transform: none } }
+.v-reveal { animation: v-reveal .5s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .v-breathe, .v-reveal { animation: none !important; opacity: 1; transform: none; }
+  * { transition-duration: .01ms !important; }
+}
+
+/* --- table --------------------------------------------------- */
+
+.v-table { width: 100%; border-collapse: collapse; text-align: left; }
+.v-table th { font-weight: 300; padding: 8px 12px; white-space: nowrap; }
+.v-table thead tr { background: rgba(231, 236, 238, .6); }
+.v-table tbody tr { border-top: 1px solid var(--sunken); }
+.v-table td { padding: 12px; vertical-align: middle; }
+.v-table tbody tr.v-pick { cursor: pointer; transition: background-color .15s ease; }
+.v-table tbody tr.v-pick:hover { background: rgba(231, 236, 238, .4); }
+.v-table .v-num { text-align: right; font-variant-numeric: tabular-nums; }

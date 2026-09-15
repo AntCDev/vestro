@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="src/styleTW.css" />
+  <title>Sweeps — Vestro</title>
+</head>
+<body class="bg-paper text-ink antialiased">
+
+<div class="mx-auto max-w-6xl px-6 py-14 md:px-10">
+
+  <!-- Top bar -->
+  <header class="flex flex-col gap-10 md:flex-row md:items-end md:justify-between">
+    <div>
+      <p class="v-lbl" style="letter-spacing:.3em">Vestro / Sweeps</p>
+      <h1 class="mt-4 text-[38px] font-extralight leading-[1.12] tracking-tight">Sweeps</h1>
+      <p class="mt-4 max-w-[62ch] text-[15px] font-light leading-[1.65] text-muted">
+        Drain one deposit address into the merchant wallet. Queued movements are grouped by
+        address and asset; a sweep claims one group and opens a transfer.
+      </p>
+    </div>
+
+    <div class="flex flex-col gap-5 md:items-end">
+      <div class="flex flex-wrap items-center gap-x-8 gap-y-3">
+        <span id="feed-status" class="flex items-center gap-2 text-[9px] uppercase tracking-[0.22em] text-muted">
+          <span id="feed-dot" class="h-1 w-1 rounded-full bg-current"></span>
+          <span id="feed-word">Idle</span>
+        </span>
+        <span class="flex items-center gap-3">
+          <span class="v-lbl">Snapshot</span>
+          <span id="generated-at" class="v-mono text-[11px] text-ink">—</span>
+        </span>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <button type="button" id="auto" class="v-btn v-btn--ghost">Auto refresh off</button>
+        <button type="button" id="refresh" class="v-btn">Refresh queue</button>
+      </div>
+
+      <a href="/ledger.html" class="text-[13px] font-light text-ink transition-colors duration-150 hover:text-accent">Open the ledger →</a>
+    </div>
+  </header>
+
+  <div id="error-box" class="mt-10 hidden border-l-2 border-stop p-4 text-[13px] font-light leading-[1.6] text-muted"></div>
+
+  <!-- Body -->
+  <div class="mt-14 grid grid-cols-1 gap-6 lg:grid-cols-[1.6fr_1fr]">
+
+    <div class="flex flex-col gap-6">
+
+      <!-- Queue -->
+      <section class="bg-surface p-6">
+        <div class="flex items-baseline justify-between">
+          <span class="v-lbl">Queued</span>
+          <span id="queue-count" class="v-lbl v-lbl--faint">—</span>
+        </div>
+        <div id="queue" class="mt-6 min-h-[140px]"></div>
+      </section>
+
+      <!-- Transfer — the live region -->
+      <section id="transfer-panel" class="bg-surface p-6">
+        <div class="flex items-baseline justify-between">
+          <span class="flex items-center gap-2">
+            <span id="transfer-dot" class="hidden h-1 w-1 rounded-full bg-accent"></span>
+            <span class="v-lbl">Transfer</span>
+          </span>
+          <span id="transfer-status" class="text-[9px] uppercase tracking-[0.22em] text-muted">—</span>
+        </div>
+        <div id="transfer" class="mt-6 min-h-[200px]"></div>
+      </section>
+
+    </div>
+
+    <div class="flex flex-col gap-6">
+
+      <!-- Manual sweep -->
+      <section class="bg-surface p-6">
+        <span class="v-lbl">Manual sweep</span>
+
+        <form id="sweep-form" class="mt-6 flex flex-col gap-6" novalidate>
+          <div>
+            <label class="v-lbl" for="address">Address</label>
+            <input type="text" id="address" class="v-input mt-2" spellcheck="false"
+                   autocomplete="off" placeholder="0x… or base58" />
+          </div>
+
+          <div>
+            <div class="flex items-baseline justify-between">
+              <label class="v-lbl" for="asset-id">Asset</label>
+              <span class="v-lbl v-lbl--faint">If several</span>
+            </div>
+            <input type="text" id="asset-id" class="v-input mt-2" spellcheck="false"
+                   autocomplete="off" placeholder="00000000-0000-0000-0000-000000000000" />
+          </div>
+
+          <div>
+            <div class="flex items-baseline justify-between">
+              <label class="v-lbl" for="handler-id">Handler</label>
+              <span class="v-lbl v-lbl--faint">If several</span>
+            </div>
+            <input type="text" id="handler-id" class="v-input mt-2" spellcheck="false"
+                   autocomplete="off" placeholder="evm-native" />
+          </div>
+
+          <div class="flex items-center gap-3">
+            <button type="submit" id="submit" class="v-btn">Sweep address</button>
+            <button type="button" id="clear" class="v-btn v-btn--ghost">Clear</button>
+          </div>
+        </form>
+
+        <div id="choices" class="mt-8 hidden"></div>
+      </section>
+
+      <!-- Session transfers -->
+      <section class="bg-surface p-6">
+        <div class="flex items-baseline justify-between">
+          <span class="v-lbl">Requested</span>
+          <span id="history-count" class="v-lbl v-lbl--faint">—</span>
+        </div>
+        <div id="history" class="mt-6 min-h-[100px]"></div>
+      </section>
+
+    </div>
+
+  </div>
+
+</div>
+
+<script type="module" src="/src/sweeps.ts"></script>
+</body>
+</html>

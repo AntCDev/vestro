@@ -11,6 +11,11 @@ use chrono::{DateTime, Utc};
 
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+
+use axum::extract::Path;
+use rust_decimal::Decimal;
+use serde_json::{json, Value};
+use sqlx::Row;
 // ==========================================
 // 1. TOKENS ENDPOINT
 // ==========================================
@@ -106,11 +111,200 @@ pub async fn list_merchants_test_handler(
 }
 
 
+// ==========================================
+// 4. SWEEP ENDPOINTS
+// ==========================================
+
+#[derive(Serialize)]
+pub struct SweepGroupRef {
+    pub merchant_id: Uuid,
+    pub network_type: String,
+    pub chain_ref: String,
+    pub custody_address: String,
+    pub asset_id: Uuid,
+    pub asset_symbol: String,
+    pub total: Decimal,
+    pub rows: i64,
+}
+
+/// GET /api/test/sweeps
+/// Everything the Ledgerer has queued and nobody has claimed yet.
+pub async fn list_sweepable_test_handler(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SweepGroupRef>>, (StatusCode, String)> {
+    let groups = state
+        .orchestrator
+        .sweepable_groups()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // sweepable_groups() is asset_id-only; decorate with the symbol so the
+    // response is readable without a second lookup.
+    let mut out = Vec::with_capacity(groups.len());
+    for g in groups {
+        let symbol: Option<String> =
+            sqlx::query_scalar("SELECT symbol FROM assets WHERE id = $1")
+                .bind(g.asset_id)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        out.push(SweepGroupRef {
+            merchant_id: g.merchant_id,
+            network_type: g.network_type,
+            chain_ref: g.chain_ref,
+            custody_address: g.custody_address,
+            asset_id: g.asset_id,
+            asset_symbol: symbol.unwrap_or_else(|| "?".into()),
+            total: g.total,
+            rows: g.rows,
+        });
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct SweepAddressReq {
+    /// The deposit address to drain. Case-insensitive for EVM, exact for base58.
+    pub address: String,
+    /// Only needed when the address holds more than one asset.
+    #[serde(default)]
+    pub asset_id: Option<Uuid>,
+    /// Only needed when two handlers claim the same asset.
+    #[serde(default)]
+    pub handler_id: Option<String>,
+}
+
+/// POST /api/test/sweeps
+/// Body: { "address": "0x…" }  ->  one outbound_transfers row.
+pub async fn sweep_address_test_handler(
+    State(state): State<AppState>,
+    Json(body): Json<SweepAddressReq>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, String)> {
+    let addr = body.address.trim().to_string();
+    if addr.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "address is required".into()));
+    }
+
+    // EVM canonicalizes to lowercase; Solana/Bitcoin are case-sensitive base58.
+    // Matching both covers a checksummed EVM address pasted from a block
+    // explorer without corrupting a base58 one.
+    let rows = sqlx::query(
+        r#"
+        SELECT q.merchant_id, q.network_type, q.chain_ref, q.custody_address,
+               q.asset_id, a.symbol,
+               SUM(q.amount) AS total, COUNT(*) AS rows
+          FROM sweep_queue q
+          JOIN assets a ON a.id = q.asset_id
+         WHERE q.status = 'pending'
+           AND (q.custody_address = $1 OR q.custody_address = lower($1))
+         GROUP BY 1,2,3,4,5,6
+         ORDER BY total DESC
+        "#,
+    )
+        .bind(&addr)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut groups: Vec<SweepGroupRef> = rows
+        .into_iter()
+        .map(|r| SweepGroupRef {
+            merchant_id: r.get("merchant_id"),
+            network_type: r.get("network_type"),
+            chain_ref: r.get("chain_ref"),
+            custody_address: r.get("custody_address"),
+            asset_id: r.get("asset_id"),
+            asset_symbol: r.get("symbol"),
+            total: r.get("total"),
+            rows: r.get("rows"),
+        })
+        .collect();
+
+    if let Some(want) = body.asset_id {
+        groups.retain(|g| g.asset_id == want);
+    }
+
+    let group = match groups.len() {
+        0 => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("no pending sweep_queue rows for {addr} — either nothing was \
+                         recognized into it, or a transfer already claimed them \
+                         (check outbound_transfers)"),
+            ))
+        }
+        1 => groups.remove(0),
+        _ => {
+            // One address, several assets. Say which, don't guess.
+            let choices: Vec<Value> = groups
+                .iter()
+                .map(|g| json!({ "asset_id": g.asset_id, "symbol": g.asset_symbol, "total": g.total }))
+                .collect();
+            return Err((
+                StatusCode::CONFLICT,
+                format!("{addr} holds {} assets — re-send with asset_id: {}",
+                        choices.len(), serde_json::to_string(&choices).unwrap()),
+            ));
+        }
+    };
+
+    let transfer_id = state
+        .orchestrator
+        .request_sweep(
+            group.merchant_id,
+            &group.network_type,
+            &group.chain_ref,
+            &group.custody_address,
+            group.asset_id,
+            body.handler_id.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "transfer_id": transfer_id,
+            "custody_address": group.custody_address,
+            "asset": group.asset_symbol,
+            "queued_total": group.total,
+            "sweep_rows": group.rows,
+            "poll": format!("/api/test/transfers/{transfer_id}"),
+        })),
+    ))
+}
+
+/// GET /api/test/transfers/{id}
+/// `to_jsonb` so this keeps working while the outbound schema is still moving.
+pub async fn get_transfer_test_handler(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let transfer: Option<Value> =
+        sqlx::query_scalar("SELECT to_jsonb(t) FROM outbound_transfers t WHERE t.id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let transfer = transfer.ok_or((StatusCode::NOT_FOUND, format!("no transfer {id}")))?;
+
+    let queue: Vec<Value> =
+        sqlx::query_scalar("SELECT to_jsonb(q) FROM sweep_queue q WHERE q.transfer_id = $1")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(json!({ "transfer": transfer, "sweep_queue": queue })))
+}
 
 
 
-
-
+// ==========================================
+// 5. LEDGER ENDPOINTS
+// ==========================================
 
 
 #[derive(Debug, Deserialize)]

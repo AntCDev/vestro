@@ -2207,6 +2207,12 @@ impl NetworkClient for EsploraNetwork {
 
     fn outbound_poll_interval(&self) -> StdDuration { StdDuration::from_secs(30) }
 
+    async fn preflight(&self, pool: &PgPool) -> Result<(), String> {
+        assert_scheme(pool, &self.derivation_scheme()).await?;
+        ensure_merchant_wallets(pool, self).await?;
+        Ok(())
+    }
+
     async fn spin_up(&self, pool: &PgPool) -> Result<(), String> {
         println!(
             "🟠 Esplora watcher up: chain_ref={} endpoints={} scheme={} (v{})",
@@ -2215,15 +2221,6 @@ impl NetworkClient for EsploraNetwork {
             ESPLORA_TEMPLATE,
             SCHEME_VERSION
         );
-
-        // 0. Code and DB must agree on the scheme before anything derives.
-        assert_scheme(pool, &self.derivation_scheme()).await?;
-
-        // 1. Main wallet for every merchant missing one. All three chains run
-        //    this; whichever gets there first writes the row, the others see
-        //    the purpose present and skip. See `localize_address` for why the
-        //    HRP on that row is not this chain's problem.
-        ensure_merchant_wallets(pool, self).await?;
 
         futures::future::join(self.chain_loop(pool), self.address_loop(pool)).await;
         Ok(())

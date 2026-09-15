@@ -9,10 +9,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// @notice Minimal custodial payment processor vault. Customers pay into a per-(token, merchant)
 ///         balance; the custodian later sweeps funds out on the merchant's behalf. Native ETH is
 ///         supported alongside ERC20 tokens, keyed internally as token == address(0).
-/// @dev No owner/admin/operator role exists on purpose. `sweep` is authorized purely by
-///      msg.sender == merchantWallet. Since the backend custodies merchant private keys, it
-///      satisfies this by signing the sweep tx directly as the merchant wallet — a role system
-///      would be redundant.
+/// @dev No owner/admin/operator role exists on purpose. `sweep`/`sweepAmount` are authorized
+///      purely by msg.sender == merchantWallet. Since the backend custodies merchant private
+///      keys, it satisfies this by signing the sweep tx directly as the merchant wallet — a role
+///      system would be redundant.
 contract CustodialPaymentVault is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -26,6 +26,7 @@ contract CustodialPaymentVault is ReentrancyGuard {
     error ZeroAddress();
     error ZeroAmount();
     error NothingToSweep();
+    error InsufficientBalance();
     error NativeTransferFailed();
     error UseNativePayment();
 
@@ -109,14 +110,33 @@ contract CustodialPaymentVault is ReentrancyGuard {
 
         _vault[token][msg.sender] = 0;
 
-        if (token == NATIVE) {
-            (bool success, ) = payable(msg.sender).call{value: amount}("");
-            if (!success) revert NativeTransferFailed();
-        } else {
-            IERC20(token).safeTransfer(msg.sender, amount);
+        _payout(token, amount);
+    }
+
+    /// @notice Sweep exactly `amount` base units of `token` belonging to msg.sender, to
+    ///         msg.sender. Pass address(0) for native ETH. Anything not swept stays credited to
+    ///         the merchant and can be swept later.
+    /// @dev Intended for sweeping only settled/confirmed invoice amounts while leaving the
+    ///      remainder (pending invoices, chargeback holds, etc.) in the vault. The vault holds a
+    ///      single pooled balance per (token, merchant) — it has no notion of which invoice a
+    ///      given wei belongs to — so the backend is responsible for computing `amount` from the
+    ///      `Payment` events it considers confirmed.
+    /// @dev Same authorization model as `sweep`: destination is hardcoded to msg.sender, so funds
+    ///      can only ever leave to the merchant wallet that owns the balance.
+    /// @param token Token to sweep. address(0) for native ETH.
+    /// @param amount Amount in base units. Must be > 0 and <= the merchant's current balance.
+    function sweepAmount(address token, uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 balance = _vault[token][msg.sender];
+        if (amount > balance) revert InsufficientBalance();
+
+        unchecked {
+            // Safe: `amount <= balance` was just checked.
+            _vault[token][msg.sender] = balance - amount;
         }
 
-        emit Swept(msg.sender, token, amount, block.timestamp);
+        _payout(token, amount);
     }
 
     /// @notice Current unswept balance of `token` held for `merchant`. Pass address(0) for ETH.
@@ -147,6 +167,22 @@ contract CustodialPaymentVault is ReentrancyGuard {
         for (uint256 i = 0; i < merchants.length; ++i) {
             balances[i] = _vault[token][merchants[i]];
         }
+    }
+
+    /// @dev Shared payout tail for `sweep` and `sweepAmount`. Callers MUST have already
+    ///      decremented `_vault[token][msg.sender]` by `amount` before calling this, so that
+    ///      checks-effects-interactions holds; `nonReentrant` on the external entrypoints blocks
+    ///      callback-based reentry regardless. Destination is always msg.sender — there is no
+    ///      code path in this contract that sends a merchant's balance anywhere else.
+    function _payout(address token, uint256 amount) private {
+        if (token == NATIVE) {
+            (bool success, ) = payable(msg.sender).call{value: amount}("");
+            if (!success) revert NativeTransferFailed();
+        } else {
+            IERC20(token).safeTransfer(msg.sender, amount);
+        }
+
+        emit Swept(msg.sender, token, amount, block.timestamp);
     }
 
     /// @dev Deliberately rejects bare ETH transfers instead of silently crediting them. A plain

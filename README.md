@@ -1,17 +1,17 @@
 # Vestro (Early Alpha)
 
 **[vestro.sh](https://vestro.sh)** — project site · **[demo.vestro.sh](https://demo.vestro.sh)** — live demo
-> ⚠️ **Status: Early Alpha.** The core architecture is in place. Invoice creation, payment observation across both payment paths, webhook delivery, and the ledgering of observed payments are implemented and working on EVM and Solana. Sweeping is designed but not yet implemented, Esplora is roughed in but untested, and nothing here has been audited. **Do not use this in production or with real funds.** See the [Roadmap & timeline](#roadmap--timeline) for exactly where things stand.
+> ⚠️ **Status: Early Alpha.** The core architecture is in place. Invoice creation, payment observation across both payment paths, webhook delivery, and the ledgering of observed payments are implemented and working on EVM and Solana. **Sweeping is now roughed in**: all outbound value movement runs through a queued intent model, and the first end-to-end sweep (vault path, EVM Sepolia) has been executed and verified on-chain. Gas feeding, sweep policy and the remaining networks/paths are still ahead. Esplora has been brought up to parity in code (ledgering, outbound transfers) but remains untested, and nothing here has been audited. **Do not use this in production or with real funds.** See the [Roadmap & timeline](#roadmap--timeline) for exactly where things stand.
 
 > ⚠️ **This project is custodial by design.** The operator's server generates and holds the private keys / signing authority for every merchant wallet it creates. Merchants are able to export their own keys as a glass-break measure, which means custody is shared in practice — but the operator remains the custodian in the sense that matters legally, and remains responsible for any funds the system receives. See [`COMPLIANCE.md`](./COMPLIANCE.md) before deploying anywhere beyond your own local testing, and [`RECONCILIATION.md`](./RECONCILIATION.md) §10 for what shared custody means operationally.
 
 ## Documentation
 
-Four companion documents go deeper than this README:
+Five companion documents go deeper than this README:
 
 - 📡 **[`NETWORKS.md`](./NETWORKS.md)** — implementation-level documentation of **how payments are detected**, per network: the dual payment paths, the payment lifecycle, scan cursors, reorg handling, idempotency guarantees, and the contract any new network implementation must satisfy. If you want to understand or extend the detection layer, start here.
-- 📒 **[`LEDGER.md`](./LEDGER.md)** — the design of the **ledgering system**: how on-chain activity is recorded, how merchant balances are derived, and how operator fees accrue and settle. A three-layer, double-entry, append-only design. The **recognition half of this document is now implemented** (see [The Ledgerer](#the-ledgerer)); the settlement/sweep half is still a design sketch ahead of the sweeping implementation.
-- 🔁 **[`RECONCILIATION.md`](./RECONCILIATION.md)** — what the system does about value that arrives at, or leaves from, a controlled address without the processor having initiated it: late payments, merchant self-moves, mistaken sends, dust. Movement-driven rather than balance-driven. Currently a design sketch ahead of the sweeping and isolation work.
+- 📒 **[`LEDGER.md`](./LEDGER.md)** — the design of the **ledgering system**: how on-chain activity is recorded, how merchant balances are derived, and how operator fees accrue and settle. A three-layer, double-entry, append-only design. The **recognition half of this document is now implemented** (see [The Ledgerer](#the-ledgerer)); the settlement/sweep half is still a design sketch; the sweep *mechanics* now exist (see [Outbound transfers](#outbound-transfers)) but the settlement journals they should produce are not yet written..
+- 🔁 **[`RECONCILIATION.md`](./RECONCILIATION.md)** — what the system does about value that arrives at, or leaves from, a controlled address without the processor having initiated it: late payments, merchant self-moves, mistaken sends, dust. Movement-driven rather than balance-driven. Currently a design sketch ahead of the isolation work.
 - ⚖️ **[`COMPLIANCE.md`](./COMPLIANCE.md)** — a plain-language explanation of **why this software is custodial, what that tends to mean legally**, and what changes the moment you enable multi-tenant mode. Not legal advice, but required reading before deploying this anywhere real.
 - 🎨 **[`STYLE.md`](./STYLE.md)** — the visual language for the operator- and merchant-facing pages: layout, type, colour, component conventions. Checkout pages are deliberately out of scope; see [Demo frontend](#demo-frontend).
 ## Index
@@ -23,6 +23,7 @@ Four companion documents go deeper than this README:
 - [Payment flows](#payment-flows)
 - [Architecture](#architecture)
 - [The Ledgerer](#the-ledgerer)
+- [Outbound transfers](#outbound-transfers)
 - [Assets in the database](#assets-in-the-database)
 - [Demo frontend](#demo-frontend)
 - [Fund isolation](#fund-isolation)
@@ -65,23 +66,30 @@ Before continuing into sweeping, the observing layer is being extended to the tw
 * [x] **Solana** network implementation — finished and fully tested, both payment paths, Ledgerer integrated
 * [x] **EVM** brought up to the same standard — both payment paths, Ledgerer integrated
 * [x] Demo pages covering the working paths end to end (see [Demo frontend](#demo-frontend))
-* [ ] **Esplora** (Bitcoin-style UTXO) network implementation — roughed in and theoretically observable, but **untested and undocumented**. Blocked mostly on the practicalities of getting usable test funds/tokens on a UTXO testnet.
+* [ ] **Esplora** (Bitcoin-style UTXO) network implementation — roughed in and brought to code parity with EVM/Solana (observing, Ledgerer integration, outbound transfer signing), but still untested and undocumented.
 
 ### 🚧 Phase 3 — Sweeping & ledgering *(in progress)*
 
-Moving funds from per-invoice deposit addresses to merchant main accounts, and accounting for every unit of value while doing it. The ledgering design is done — see [`LEDGER.md`](./LEDGER.md) — and the recognition half of it is now implemented.
+Moving funds from per-invoice deposit addresses to merchant main accounts, and accounting for every unit of value while doing it. The ledgering design is done — see [`LEDGER.md`](./LEDGER.md) — the recognition half of it is implemented, and the mechanics of moving value out are now roughed in.
+
 
 - [x] Ledgering system design (three-layer, double-entry, append-only — see `LEDGER.md`)
 - [x] **Ledgerer implemented** — the single writer for `chain_transactions`, `chain_movements`, `sweep_queue`, `ledger_journals` and `ledger_entries`; detection, confirmation, recognition, orphan/reversal
 - [x] Ledgerer integrated into the EVM and Solana observing paths
 - [x] Assets promoted to first-class database rows, independent of the in-code handler registry
 - [x] Token elements split into **Descriptor / Invoicer / Sweeper**, each advertising its own capability
-- [ ] Sweeper element implementations (the per-token half of the sweep)
-- [ ] Sweeper service — the counterpart to the Ledgerer, chain-agnostic, driving the sweep queue
-- [ ] Sweeping network code: deposit addresses → merchant main accounts
-- [ ] Gas refilling mechanics for deposit addresses that need native token to move ERC-20s
-- [ ] Settlement-side journals (the sweep/fee-settlement half of `LEDGER.md`)
-- [ ] Orchestrator endpoints to trigger sweeps manually and to configure the conditions under which they happen automatically
+- [x] **Outbound transfer intent model** — every value movement (sweep, gas top-up, withdrawal) is queued as an `outbound_transfers` row and executed asynchronously; leased claims, retries, supersede-by-fee-bump, raw-tx rebroadcast without re-signing. See [Outbound transfers](#outbound-transfers)
+- [x] Intent planning split: orchestrator drafts the intent → the network handler fills in chain-specific detail → orchestrator persists it
+- [x] Per-network transfer workers that poll for intents on their own chain and execute them, mirroring the invoice-checking loop
+- [x] **First end-to-end sweep** — EVM Sepolia, vault path: invoice → payment → `system_confirmed` → ledgered → sweep intent → signed → broadcast → landed in the merchant main account. Tested against missing gas on the signer and a service restart with a pending intent
+- [x] `CustodialPaymentVault.sweepAmount(token, amount)` alongside the drain-everything `sweep(token)`, so only `system_confirmed` value is swept and still-confirming value stays put
+- [ ] Sweeper element implementations for the remaining tokens / networks
+- [ ] Sweeping on the remaining paths: EVM deposit addresses, Solana, Esplora
+- [ ] **Gas feeding** — `gas_topup` intents from a merchant's gas address to deposit addresses that need native token to move ERC-20s
+- [ ] **Sweep policy** in the orchestrator — when to sweep: minimum age, value vs. current gas price, gas as a % of sweep value, per-merchant/per-asset thresholds
+- [ ] Settlement-side journals (the sweep/fee-settlement half of `LEDGER.md`), written from confirmed outbound transfers
+- [ ] Authenticated orchestrator endpoints for manual sweeps and policy configuration (the demo currently exposes the manual trigger without security)
+
 
 ### 🔜 Phase 4 — Containerization
 
@@ -105,11 +113,11 @@ Two related problems that are best solved together. *Isolation* is the property 
 
 ## Supported networks (in progress)
 
-- **EVM** — Ethereum mainnet + L2s (Base, etc.) — *complete: both payment paths, ledgering integrated. Current reference network.*
+- **EVM** — Ethereum mainnet + L2s (Base, etc.) — *complete: both payment paths, ledgering integrated. Sweeping roughed in: vault path executed end to end on Sepolia. Current reference network.* 
 - **Solana** — mainnet, devnet — *complete: both payment paths, ledgering integrated.*
-- **Esplora-compatible** (Bitcoin and similar UTXO chains) — *roughed in: observing path exists in theory, untested and undocumented.*
+- **Esplora-compatible** (Bitcoin and similar UTXO chains) — *roughed in: observing, ledgering and outbound transfer code at parity with the others, all untested and undocumented.*
 
-No network has a sweeper yet; that is Phase 3 work and applies to all three equally.
+Sweeping mechanics are network-agnostic (see [Outbound transfers](#outbound-transfers)); only EVM has been exercised so far. Solana and Esplora have been roughed in but untested.
 
 Token support is designed to be cheap to extend: most EVM tokens reuse the same handler logic with different addresses/decimals, so adding a new ERC-20/BEP-20-style token is close to a config change rather than new code.
 
@@ -134,19 +142,37 @@ The system is split into four layers:
 
   - **Descriptor** — the purely informational half: decimals, asset id, symbol, network, and whatever else identifies or describes the token. No behaviour.
   - **Invoicer** — creates the payment instrument for an invoice (address, contract call parameters, reference key, whatever the network needs) in a form its network client can then observe.
-  - **Sweeper** — *not yet implemented*. Will own the token-specific half of moving value out of a deposit address or vault.
+  - **Sweeper** — *roughed in*. Owns the token-specific half of moving value out of a deposit address or vault: it turns a drafted intent into a fully specified, signable transfer for its network."
+
 
    Each element **advertises its own capability**, so a token can be registered as informational-only (it will be described and ledgered correctly, but no invoice can be created against it), as invoiceable/observable, and/or as sweepable — independently. This is what lets an asset exist on the books without pretending the system can do more with it than it can.
 
-3. **Orchestrator** — the entry point for creating an invoice. It is deliberately network-agnostic: it doesn't know or care whether a token ID resolves to EVM, Solana, or Esplora. It generates the invoice record, hands off to the relevant token handler to start watching for payment, and separately runs a service that scans for completed payments and dispatches webhooks (with retry and at-least-once delivery semantics).
+3. **Orchestrator** — the entry point for creating an invoice. It is deliberately network-agnostic: it doesn't know or care whether a token ID resolves to EVM, Solana, or Esplora. It generates the invoice record, hands off to the relevant token handler to start watching for payment, and separately runs a service that scans for completed payments and dispatches webhooks (with retry and at-least-once delivery semantics). It is also where **outbound value movement is decided**: the orchestrator owns sweep policy (what to sweep, when, whether it's worth the gas), drafts the corresponding intents, and persists them once the responsible handler has filled in the chain-specific details. It never signs or broadcasts anything itself.
 
 4. **Ledgerer** — the accounting counterpart to the orchestrator, and equally network-agnostic. See below.
 
 This separation means adding a new chain means implementing one trait, and adding a new token on an existing chain means (in most cases) registering a handler with different parameters — not writing new payment-detection logic from scratch. The full contract a new network must satisfy is documented in [`NETWORKS.md`](./NETWORKS.md).
 
-### Planned: the Sweeper service
+## Outbound transfers
 
-Sweeping will mirror the Ledgerer's shape rather than living inside the network implementations: a chain-agnostic **Sweeper** service looks at an asset, resolves the handler responsible for it, asks that handler for its sweeper element, and issues a sweep signal. The handler translates that into whatever call its network client needs. The service itself never learns what a UTXO or a nonce is — same division of labour as the Ledgerer.
+Every movement of value the system itself initiates — sweeps, gas top-ups, withdrawals — goes through one table, `outbound_transfers`, as an **intent**. Nothing is signed inline; an intent is written, and a worker picks it up later.
+
+The lifecycle is split three ways, along the same seam as everything else:
+
+1. **Orchestrator (plan)** — decides that a movement should happen. For sweeps it walks `sweep_queue`, applies policy (age, value vs. gas, percentage thresholds), and drafts a chain-agnostic intent: merchant, asset, from/to, amount or drain, which key role signs and which pays fees.
+2. **Network handler (specialise)** — receives the draft and fills in whatever its chain needs (`params`, fee payer, contract call shape, UTXO selection, …), then hands it back.
+3. **Orchestrator (persist)** — writes the finished intent as `pending`.
+
+Each network object spawns a **transfer worker** alongside its payment-checking loop. The worker polls for intents matching its own `network_type` / `chain_ref`, takes a lease (`claimed_at`, so a dead worker's claim expires), builds and signs, broadcasts, and walks the row through `signed → broadcast → confirmed`, or `failed` with `last_error` and `attempts` for retry.
+
+Guarantees the table enforces:
+
+- **One live transfer per (chain, source address, asset).** Two concurrent sweeps of the same address would race on nonce and balance; a partial unique index makes that impossible.
+- **Signed once, rebroadcast verbatim.** `raw_tx` is stored and replayed; a stuck transfer is *superseded* by a new row (`supersedes`) rather than re-signed in place.
+- **Requested vs. resolved amounts** are both recorded, so a drain (`amount_requested = NULL`) is auditable after the fact.
+- `sweep_queue` rows point at the transfer moving them (`transfer_id`), many-to-one.
+
+This is deliberately the mirror of the Ledgerer: the orchestrator never learns what a nonce or a UTXO is, and the network code never decides *whether* to move money, only *how*.
 
 ## The Ledgerer
 
@@ -158,7 +184,7 @@ It has four write points:
 
 - **Detection** — upsert the transaction and append its movements. Nothing enters the ledger yet. Idempotent: replaying a transaction is a no-op, except that an orphaned transaction which re-lands is flipped back to `detected`.
 - **Confirmation** — `detected` → `confirmed`. Chain layer only; the ledger does not move.
-- **Recognition** — value enters the ledger. One `payment_recognized` journal behind a dedupe latch, value legs into the custody account implied by the movement's destination (`deposit_address`/`vault` → unswept, `merchant_main` → treasury) against `payable_to_merchant`, fee legs at the route's resolved rate, and one `sweep_queue` row per movement whenever value landed unswept.
+- **Recognition** — value enters the ledger. One `payment_recognized` journal behind a dedupe latch, value legs into the custody account implied by the movement's destination (`deposit_address`/`vault` → unswept, `merchant_main` → treasury) against `payable_to_merchant`, fee legs at the route's resolved rate, and one `sweep_queue` row per movement whenever value landed unswept. Those rows are later claimed by an outbound transfer via `transfer_id`. 
 - **Orphaning** — chain layer to `orphaned`, pending sweep rows dropped. If a recognition journal exists, a probabilistic-finality chain gets a reversal journal; an absolute-finality chain raises, because a reversal there means something upstream lied.
 
 Custody is booked from where the value physically *is* (the movement's destination address kind), never from how the payment was identified. A vault payment log and a deposit-address transfer are both unswept; a Solana reference payment straight into the merchant's account is treasury.
@@ -221,6 +247,7 @@ Both confirmation depths (`payment.confirmed` and `payment.finalized`) are confi
 ## Data / correctness principles
 
 - PostgreSQL, designed around ACID guarantees and idempotent operations — invoice creation, sweeps, and webhook dispatch are all built to be safely retryable without double-processing.
+- Outbound value moves are intents, not calls. Every sweep, gas top-up or withdrawal is a row before it is a transaction; it is leased, signed once, rebroadcast verbatim, and superseded rather than mutated. A restart mid-flight resumes from the table.
 - The ledger is double-entry and append-only: corrections are reversals, never edits, and merchant balances are always derived, never incremented. The recognition path is implemented; the settlement path is designed — see [`LEDGER.md`](./LEDGER.md).
 - Exactly one writer for the ledger tables. Network code never writes accounting rows; it reports observations and the Ledgerer decides what they mean.
 - No NFT, trading, or speculative-market functionality. This is infrastructure for accepting payment, not a wallet, exchange, or trading tool.

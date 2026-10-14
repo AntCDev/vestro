@@ -144,21 +144,55 @@ impl TokenHandler for SepoliaHandler {
     fn sweeper(&self) -> Option<&dyn Sweeper> { Some(self) }
 }
 
+
 #[async_trait]
 impl Sweeper for SepoliaHandler {
     async fn plan(&self, _pool: &PgPool, d: &SweepDraft) -> Result<TransferPlan, String> {
         match d.custody_kind {
-            AddressKind::DepositAddress => Ok(TransferPlan {
-                from: SourceAccount {
-                    address: d.custody_address.clone(),
-                    kind: d.custody_kind,
-                    authority: d.authority,
-                },
-                to: d.destination.clone(),
-                amount: TransferAmount::Max,
-                fee_payer: None,
-                params: json!({}),
-            }),
+            AddressKind::DepositAddress => {
+                // On EVM the deposit address is its own authority. A mismatch
+                // here is a bad authority_ref from the connector; better to
+                // refuse the plan than to fail at signing time.
+                if d.custody_address.to_lowercase() != d.authority_address.to_lowercase() {
+                    return Err(format!(
+                        "deposit sweep: custody {} but authority {} ({}) — an EOA can only sign for itself",
+                        d.custody_address, d.authority_address, d.authority.to_ref()
+                    ));
+                }
+
+                let token = self.descriptor.asset.key.address.clone();
+                let native = token.is_none();
+
+                Ok(TransferPlan {
+                    from: SourceAccount {
+                        address: d.custody_address.clone(),
+                        kind: AddressKind::DepositAddress,
+                        authority: d.authority,
+                    },
+                    to: d.destination.clone(),
+                    // Confirmed figure from the claimed rows. Anything else at
+                    // the address waits for its own rows.
+                    amount: d.amount,
+                    fee_payer: None,
+                    params: json!({
+                        "mechanism": if native { "native_transfer" } else { "erc20_transfer" },
+                        "token": token,
+                        "authority_address": d.authority_address.to_lowercase(),
+                        // Native: gas is paid from the swept value itself.
+                        // ERC-20: gas is paid in ETH that was fed to the address.
+                        "fee_from_amount": native,
+                        // Which custody account the Ledgerer debits for gas.
+                        // Native: the same pool the value came from.
+                        // ERC-20: fed ETH, which is not revenue — custody_gas,
+                        // not the merchant's pooled unswept native balance.
+                        "fee_from": if native {
+                            AddressKind::DepositAddress.as_str()
+                        } else {
+                            AddressKind::Gas.as_str()
+                        },
+                    }),
+                })
+            }
 
             AddressKind::Vault => {
                 let vault = self
@@ -198,6 +232,8 @@ impl Sweeper for SepoliaHandler {
                         "vault": vault,
                         "token": self.descriptor.asset.key.address,
                         "authority_address": d.authority_address.to_lowercase(),
+                        // sweep() is paid for by its caller, not the vault.
+                        "fee_from": AddressKind::MerchantMain.as_str(),
                     }),
                 })
             }

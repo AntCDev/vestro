@@ -178,7 +178,7 @@ pub const DEFAULT_VAULT_PAY_ABI: &str =
 
 pub const DEFAULT_VAULT_PAY_NATIVE_ABI: &str =
     "function payNative(bytes16 identifier, address merchant) payable";
-
+const NATIVE_TRANSFER_GAS: u64 = 21_000;
 pub const EVM_COIN_TYPE: u32 = 60;
 pub const EVM_TEMPLATE: &str = "m/44'/{coin}'/{role}'/{index}'";
 
@@ -2807,16 +2807,36 @@ impl EVMNetwork {
         })
     }
 
-    async fn fee_params(&self) -> Result<(u128, u128), String> {
+    /// (base_fee, priority_fee): latest block's base fee and the node's tip
+    /// suggestion (1 gwei if the node won't say).
+    async fn fee_components(&self) -> Result<(u128, u128), String> {
         let block = self.call_rpc_json("eth_getBlockByNumber", json!(["latest", false])).await?;
         let base = block["baseFeePerGas"].as_str()
-            .map(|h| hex_to_u128(h.trim_start_matches("0x")).unwrap_or(0))
+            .map(|h| hex_to_u128(h).unwrap_or(0))
             .unwrap_or(0);
         let priority = match self.call_rpc("eth_maxPriorityFeePerGas", json!([])).await {
-            Ok(h) => hex_to_u128(h.trim_start_matches("0x")).unwrap_or(1_000_000_000),
+            Ok(h) => hex_to_u128(&h).unwrap_or(1_000_000_000),
             Err(_) => 1_000_000_000, // 1 gwei; pre-London / stingy providers
         };
+        Ok((base, priority))
+    }
+
+    /// (max_priority_fee, max_fee) for ordinary EIP-1559 txs. Same values as before.
+    async fn fee_params(&self) -> Result<(u128, u128), String> {
+        let (base, priority) = self.fee_components().await?;
         Ok((priority, base * 2 + priority))
+    }
+
+    /// One price used as both caps, for exact-fee native transfers.
+    ///
+    /// Base fee can rise 12.5% per block; +25% covers two full blocks of growth.
+    /// If base outruns it the tx waits in the mempool rather than failing, and
+    /// transfer_status keeps reporting Pending. The overpayment is roughly
+    /// base/4 per gas in tip — on a 21000-gas tx, a rounding error on Sepolia and
+    /// cents on mainnet.
+    async fn flat_gas_price(&self) -> Result<u128, String> {
+        let (base, priority) = self.fee_components().await?;
+        Ok(base + base / 4 + priority)
     }
 
     async fn estimate_gas(&self, from: &str, to: &str, value: u128, data: &[u8]) -> Result<u64, String> {
@@ -2829,6 +2849,151 @@ impl EVMNetwork {
         Ok(g + g / 5) // 20% headroom
     }
 
+    /// Native value out of an EOA, priced so the fee is known exactly before
+    /// signing.
+    ///
+    /// gas_limit = gas_used = 21000 (recipient has no code), and
+    /// max_fee == max_priority_fee == price. The effective gas price is
+    /// min(max_fee, base + tip), which is `price` whenever the tx is includable,
+    /// so the fee is exactly 21000 * price: nothing refunded, nothing left behind.
+    /// That is what lets `fee_from_amount` net the fee out of the swept figure and
+    /// still have amount + fee_paid equal the queued total on the ledger.
+    ///
+    /// The cost: the tip absorbs the base-fee headroom (see `flat_gas_price`).
+    async fn sign_native_sweep(
+        &self,
+        pool: &PgPool,
+        key: &k256::ecdsa::SigningKey,
+        from_lc: &str,
+        req: &TransferRequest,
+    ) -> Result<SignedTransfer, String> {
+        let to_lc = req.to.to_lowercase();
+        let to20 = parse_address(&to_lc)?;
+
+        // A contract recipient can burn more than 21000 (receive/fallback), and
+        // then the exact-fee arithmetic is wrong. Main wallets are derived EOAs,
+        // so this only fires on misconfiguration.
+        let code = self.call_rpc("eth_getCode", json!([to_lc, "latest"])).await?;
+        if !code.trim_start_matches("0x").trim_start_matches('0').is_empty() {
+            return Err(format!(
+                "{to_lc} has contract code; a native sweep to it can't be priced exactly"));
+        }
+
+        let price = self.flat_gas_price().await?;
+        let fee = NATIVE_TRANSFER_GAS as u128 * price;
+        let balance = self.get_native_balance(from_lc).await?.0;
+        let fee_from_amount = req.params
+            .get("fee_from_amount")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // (total leaving the address, value reaching `to`)
+        let (gross, amount) = match req.amount {
+            TransferAmount::Exact(n) if fee_from_amount => (n, n.saturating_sub(fee)),
+            TransferAmount::Exact(n) => (n.checked_add(fee).ok_or("amount + fee overflows")?, n),
+            TransferAmount::Max => (balance, balance.saturating_sub(fee)),
+        };
+
+        if amount == 0 {
+            return Err(format!(
+                "{from_lc}: fee {fee} wei consumes the whole sweep of {gross} wei — not sending"));
+        }
+        if balance < gross {
+            return Err(if fee_from_amount {
+                // The ledger says more is confirmed here than the chain holds:
+                // double-counted rows, or a sweep that landed without settle().
+                format!("{from_lc}: plan asks {gross} wei, balance is {balance}")
+            } else {
+                format!("{from_lc}: has {balance} wei, needs {gross} (gas refill required)")
+            });
+        }
+
+        let nonce = self.allocate_nonce(pool, from_lc).await?;
+        let tx = Eip1559Tx {
+            chain_id: self.chain_id,
+            nonce,
+            max_priority_fee: price,
+            max_fee: price,
+            gas_limit: NATIVE_TRANSFER_GAS,
+            to: to20,
+            value: amount,
+            data: Vec::new(),
+        };
+        let (raw, tx_hash) = tx.sign(key)?;
+
+        Ok(SignedTransfer {
+            tx_hash, raw, amount,
+            from: from_lc.to_string(),
+            valid_until: None,
+            nonce: Some(nonce),
+            fee_estimate: Some(fee), // exact, not an upper bound
+        })
+    }
+
+    /// ERC-20 out of a deposit address. Gas is paid in ETH that has to already be
+    /// there (gas feeder / manual top-up); without it this fails soft and the
+    /// next tick retries.
+    async fn sign_erc20_sweep(
+        &self,
+        pool: &PgPool,
+        key: &k256::ecdsa::SigningKey,
+        from_lc: &str,
+        token_lc: &str,
+        req: &TransferRequest,
+    ) -> Result<SignedTransfer, String> {
+        let to20 = parse_address(&req.to)?;
+        let token20 = parse_address(token_lc)?;
+
+        let held = self.get_token_balance(token_lc, from_lc, 0).await?.0;
+        let amount = match req.amount {
+            TransferAmount::Exact(n) => {
+                if n > held {
+                    // Would revert in transfer(). Fail before burning gas or a nonce.
+                    return Err(format!(
+                        "{from_lc}: plan asks {n} of {token_lc}, balance is {held}"));
+                }
+                n
+            }
+            TransferAmount::Max => held,
+        };
+        if amount == 0 {
+            return Err(format!("{from_lc}: nothing to sweep for {token_lc}"));
+        }
+
+        let data = erc20_transfer_calldata(&to20, amount);
+        let (priority, max_fee) = self.fee_params().await?;
+        let gas_limit = self.estimate_gas(from_lc, token_lc, 0, &data).await?;
+
+        // Gas must be there NOW. If not, fail before touching the nonce counter.
+        let native = self.get_native_balance(from_lc).await?.0;
+        let needed = gas_limit as u128 * max_fee;
+        if native < needed {
+            return Err(format!("{from_lc}: has {native} wei, needs {needed} (gas refill required)"));
+        }
+
+        let nonce = self.allocate_nonce(pool, from_lc).await?;
+        let tx = Eip1559Tx {
+            chain_id: self.chain_id,
+            nonce,
+            max_priority_fee: priority,
+            max_fee,
+            gas_limit,
+            to: token20,
+            value: 0,
+            data,
+        };
+        let (raw, tx_hash) = tx.sign(key)?;
+
+        Ok(SignedTransfer {
+            tx_hash, raw, amount,
+            from: from_lc.to_string(),
+            valid_until: None,
+            nonce: Some(nonce),
+            fee_estimate: Some(needed), // upper bound; fee_paid comes from the receipt
+        })
+    }    
+    
+    
 }
 
 #[async_trait]
@@ -2908,6 +3073,7 @@ impl NetworkClient for EVMNetwork {
             .map_err(|_| "Failed to parse hex block number".to_string())
     }
 
+
     async fn build_and_sign(&self, pool: &PgPool, mnemonic: &str, req: &TransferRequest)
                             -> Result<SignedTransfer, String>
     {
@@ -2925,64 +3091,27 @@ impl NetworkClient for EVMNetwork {
             return self.sign_vault_sweep(pool, &key, &derived_lc, req).await;
         }
 
+        // Everything else is an EOA signing for itself.
         if derived_lc != req.from.address.to_lowercase() {
             return Err(format!(
                 "authority {} derives {} but from_address is {} — refusing to sign",
                 req.from.authority.to_ref(), derived_addr, req.from.address));
         }
-        let from = &req.from.address;
-        let to20 = parse_address(&req.to)?;
-        let (priority, max_fee) = self.fee_params().await?;
-
-        let (tx_to, value, data, amount) = match &req.asset.address {
-            None => {
-                // Native. Gas for a plain send is fixed; estimate anyway in case `to` is a contract.
-                let gas = self.estimate_gas(from, &req.to, 1, &[]).await?;
-                let amount = match req.amount {
-                    TransferAmount::Exact(n) => n,
-                    TransferAmount::Max => {
-                        let bal = self.get_native_balance(from).await?.0;
-                        let reserve = gas as u128 * max_fee;
-                        bal.checked_sub(reserve)
-                            .ok_or_else(|| format!("{from}: balance {bal} < gas reserve {reserve}"))?
-                    }
-                };
-                (to20, amount, Vec::new(), amount)
+        if let Some(expected) = req.params.get("authority_address").and_then(Value::as_str) {
+            if expected.to_lowercase() != derived_lc {
+                return Err(format!(
+                    "authority {} derives {derived_lc}, plan says {expected} — refusing to sign",
+                    req.from.authority.to_ref()));
             }
-            Some(token) => {
-                let amount = match req.amount {
-                    TransferAmount::Exact(n) => n,
-                    TransferAmount::Max => self.get_token_balance(token, from, 0).await?.0,
-                };
-                if amount == 0 { return Err(format!("{from}: nothing to sweep for {token}")); }
-                (parse_address(token)?, 0, erc20_transfer_calldata(&to20, amount), amount)
-            }
-        };
-
-        let gas_limit = self.estimate_gas(
-            from, &format!("0x{}", hex::encode(tx_to)), value, &data).await?;
-
-        // Gas must be there NOW. If not, fail before touching the nonce counter.
-        let native = self.get_native_balance(from).await?.0;
-        let needed = value + gas_limit as u128 * max_fee;
-        if native < needed {
-            return Err(format!("{from}: has {native} wei, needs {needed} (gas refill required)"));
         }
 
-        let nonce = self.allocate_nonce(pool, from).await?;
-        let tx = Eip1559Tx {
-            chain_id: self.chain_id, nonce, max_priority_fee: priority, max_fee,
-            gas_limit, to: tx_to, value, data,
-        };
-        let (raw, tx_hash) = tx.sign(&key)?;
-
-        Ok(SignedTransfer {
-            tx_hash, raw, amount,
-            from: from.clone(),
-            valid_until: None,
-            nonce: Some(nonce),
-            fee_estimate: Some(gas_limit as u128 * max_fee),
-        })
+        match req.asset.address.as_deref() {
+            None => self.sign_native_sweep(pool, &key, &derived_lc, req).await,
+            Some(token) => {
+                let token_lc = token.to_lowercase();
+                self.sign_erc20_sweep(pool, &key, &derived_lc, &token_lc, req).await
+            }
+        }
     }
 
     async fn broadcast(&self, signed: &SignedTransfer) -> Result<(), String> {

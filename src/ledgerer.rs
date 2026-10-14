@@ -367,6 +367,7 @@ pub struct OutboundSettled {
     /// Which custody account the fee came out of: Gas (fee payer model) or
     /// the source address's own native balance (self-funded).
     pub fee_from_kind: AddressKind,
+    pub fee_from_address: String
 }
 
 impl Ledgerer {
@@ -821,7 +822,7 @@ impl Ledgerer {
             .execute(&mut *conn).await?;
         if s.fee_paid > Decimal::ZERO {
             // Fee "destination" is the chain itself; recorded as external.
-            mv(1, native.id, s.fee_paid, &s.from_address, s.fee_from_kind, "", AddressKind::External)
+            mv(1, native.id, s.fee_paid, &s.fee_from_address, s.fee_from_kind, "", AddressKind::External)
                 .execute(&mut *conn).await?;
         }
 

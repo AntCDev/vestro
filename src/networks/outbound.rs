@@ -109,6 +109,7 @@ pub struct TransferRow {
     nonce: Option<i64>,
     valid_until: Option<i64>,
     fee_estimate: Option<String>,
+    signer_address: Option<String>
 }
 
 impl TransferRow {
@@ -116,11 +117,14 @@ impl TransferRow {
         Ok(SignedTransfer {
             tx_hash: self.tx_hash.clone().ok_or("row has no tx_hash")?,
             raw: self.raw.clone().ok_or("row has no raw_tx")?,
-            from: self.req.from.address.clone(),
+            // The account whose nonce this tx consumed. Equal to from_address
+            // except on a vault sweep, where from_address is the contract.
+            from: self.signer_address.clone()
+                .ok_or_else(|| format!("signed row {} has no signer_address", self.id))?,
             amount: self.amount_resolved.as_deref().ok_or("row has no amount_resolved")?
                 .parse().map_err(|e| format!("amount_resolved: {e}"))?,
             valid_until: self.valid_until.map(|v| v as u64),
-            nonce: self.nonce.map(|v| v as i64 as u64),
+            nonce: self.nonce.map(|v| v as u64),
             fee_estimate: self.fee_estimate.as_deref().and_then(|s| s.parse().ok()),
         })
     }
@@ -155,6 +159,7 @@ struct TransferDbRow {
     fee_estimate: Option<String>,
     asset_kind: String,
     asset_address: Option<String>,
+    signer_address: Option<String>
 }
 
 impl TryFrom<TransferDbRow> for TransferRow {
@@ -279,6 +284,7 @@ async fn fetch_by_id(pool: &PgPool, id: Uuid) -> Result<TransferRow, String> {
                t.raw_tx                 AS "raw_tx?",
                t.nonce                  AS "nonce?",
                t.valid_until            AS "valid_until?",
+               t.signer_address         AS "signer_address?",
                t.fee_estimate::text     AS "fee_estimate?",
                a.asset_kind             AS "asset_kind!",
                a.address                AS "asset_address?"
@@ -320,6 +326,7 @@ async fn load(pool: &PgPool, net: &dyn NetworkClient, status: &str) -> Result<Ve
                t.nonce                  AS "nonce?",
                t.valid_until            AS "valid_until?",
                t.fee_estimate::text     AS "fee_estimate?",
+               t.signer_address         AS "signer_address?",
                a.asset_kind             AS "asset_kind!",
                a.address                AS "asset_address?"
           FROM outbound_transfers t
@@ -350,12 +357,13 @@ async fn sign_and_persist(pool: &PgPool, net: &dyn NetworkClient, row: &Transfer
     let signed = net.build_and_sign(pool, &mnemonic, &row.req).await?;
     drop(mnemonic);
 
-    let n = sqlx::query!(
+    let res = sqlx::query!(
         r#"
         UPDATE outbound_transfers
            SET status = 'signed', tx_hash = $2, raw_tx = $3,
                amount_resolved = $4::text::numeric,
                nonce = $5, valid_until = $6, fee_estimate = $7::text::numeric,
+               signer_address = $8,
                claimed_at = NULL, last_error = NULL, updated_at = now()
          WHERE id = $1 AND status = 'pending'
         "#,
@@ -366,21 +374,69 @@ async fn sign_and_persist(pool: &PgPool, net: &dyn NetworkClient, row: &Transfer
         signed.nonce.map(|n| n as i64),
         signed.valid_until.map(|v| v as i64),
         signed.fee_estimate.map(|f| f.to_string()),
+        signed.from.as_str(),
     )
         .execute(pool)
-        .await
-        .map_err(|e| format!("persist signed tx: {e}"))?
-        .rows_affected();
+        .await;
 
-    if n == 0 {
-        // Row left `pending` under us. We hold a signature recorded nowhere —
-        // loudly, so it can't be mistaken for a no-op.
-        return Err(format!(
-            "persist signed tx: row {} no longer pending, hash {} not stored",
-            row.id, signed.tx_hash
-        ));
+    match res {
+        Ok(r) if r.rows_affected() == 1 => Ok(()),
+        other => {
+            // The raw bytes die with this function, so the nonce they used will
+            // never be broadcast. Hand it back or every later tx from this
+            // address stalls behind the gap.
+            //
+            // On an Err the UPDATE may in fact have committed (lost response).
+            // Releasing then lets a later tx reuse the nonce; one of the two
+            // mines and the other goes Expired -> supersede. That's recoverable;
+            // a gap is not.
+            release_nonce(pool, row, &signed).await;
+            Err(match other {
+                Err(e) => format!("persist signed tx: {e}"),
+                Ok(_) => format!(
+                    "persist signed tx: row {} no longer pending, hash {} not stored",
+                    row.id, signed.tx_hash
+                ),
+            })
+        }
     }
-    Ok(())
+}
+
+/// Return an allocated-but-unused nonce to chain_nonces. Compare-and-swap: only
+/// if nothing was allocated after it. If something was, the gap is real and
+/// needs filling by hand (a 0-value self-transfer at that nonce).
+async fn release_nonce(pool: &PgPool, row: &TransferRow, signed: &SignedTransfer) {
+    let Some(nonce) = signed.nonce else { return }; // nonce-less networks
+    let chain = &row.req.asset.chain;
+    let res = sqlx::query(
+        r#"
+        UPDATE chain_nonces
+           SET next_nonce = $4, updated_at = now()
+         WHERE address = $1 AND network_type = $2 AND chain_ref = $3
+           AND next_nonce = $4 + 1
+        "#,
+    )
+        .bind(&signed.from)
+        .bind(&chain.network_type)
+        .bind(&chain.chain_ref)
+        .bind(nonce as i64)
+        .execute(pool)
+        .await;
+
+    match res {
+        Ok(r) if r.rows_affected() == 1 => {
+            eprintln!("outbound {}: released nonce {nonce} for {}", row.id, signed.from);
+        }
+        Ok(_) => eprintln!(
+            "outbound {}: NONCE GAP — {nonce} for {} abandoned after later nonces were \
+             allocated; txs from this address will stall until it is filled",
+            row.id, signed.from
+        ),
+        Err(e) => eprintln!(
+            "outbound {}: could not release nonce {nonce} for {}: {e}",
+            row.id, signed.from
+        ),
+    }
 }
 
 /// Transient failure: release the lease, keep the status, record the error.
@@ -525,6 +581,19 @@ async fn settle(pool: &PgPool, ledger: &Ledgerer, row: &TransferRow, signed: &Si
         .await
         .map_err(|e| format!("close sweep rows: {e}"))?;
 
+    let fee_from_kind = row.req.params
+        .get("fee_from")
+        .and_then(Value::as_str)
+        .and_then(AddressKind::from_db)
+        .unwrap_or(if row.req.fee_payer.is_some() {
+            AddressKind::Gas
+        } else if row.req.from.kind == AddressKind::Vault {
+            AddressKind::MerchantMain // sweep() is paid for by its caller
+        } else {
+            row.req.from.kind
+        });
+
+
     ledger.record_outbound(&mut tx, &OutboundSettled {
         transfer_id: row.id,
         merchant_id: row.merchant_id,
@@ -540,7 +609,11 @@ async fn settle(pool: &PgPool, ledger: &Ledgerer, row: &TransferRow, signed: &Si
         to_kind: AddressKind::MerchantMain, // sweep destination; intent-specific later
         amount: Decimal::from_str_exact(&signed.amount.to_string()).map_err(|e| e.to_string())?,
         fee_paid: Decimal::from_str_exact(&fee_paid.to_string()).map_err(|e| e.to_string())?,
-        fee_from_kind: if row.req.fee_payer.is_some() { AddressKind::Gas } else { row.req.from.kind },
+        fee_from_kind,
+        // The account that actually spent the gas: the deposit address itself,
+        // or the merchant wallet that called sweep() — never the vault.
+        fee_from_address: signed.from.clone(),
+
     }).await?;
 
     tx.commit().await.map_err(|e| e.to_string())

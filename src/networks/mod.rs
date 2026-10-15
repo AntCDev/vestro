@@ -170,9 +170,6 @@ impl NetworkRegistry {
         Self { evm, sol, esplora }
     }
 
-    /// Spawn every configured watcher. Call this LAST in main, after the token
-    /// registry is built and after `sync_assets` has run — a watcher must never
-    /// be able to credit a payment against an asset row that does not exist yet.
     pub fn spin_up_all(&self, pool: &PgPool) {
         println!("\n👁️  Spinning up network watchers...");
 

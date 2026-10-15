@@ -26,13 +26,14 @@ use tokio::sync::RwLock;
 use chrono::DateTime;
 use sqlx::Row;
 use crate::keys::store::assert_scheme;
-use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets};
+use crate::keys::wallets::{allocate_deposit_index, ensure_merchant_wallets, wallet_address};
 use crate::ledgerer::{
     AddressKind, AssetKey, ChainRef, Custody, Finality, LedgerError, Ledgerer,
     ObservedInbound, ObservedTransfer, OrphanInput, PaymentPath, RecognizeInput,
 };
 use ed25519_dalek::{Signer, SigningKey};
-use crate::networks::transfers::{SignedTransfer, TransferAmount, TransferRequest, TransferStatus};
+use crate::networks::transfers::{SignedTransfer, SignerRef, SourceAccount, TransferAmount, TransferRequest, TransferStatus};
+use crate::tokens::sweeper::{SweepDraft, TransferPlan};
 
 // ==========================================
 // ### PRIVATE RPC STRUCTS ###
@@ -81,6 +82,19 @@ pub const SOLANA_TEMPLATE: &str = "m/44'/{coin}'/{role}'/{index}'";
 pub const SOLANA_HARDENED_OFFSET: u32 = 0x8000_0000;
 
 const SOLANA_REQUIRED_WALLETS: &[WalletSpec] = &[MAIN_WALLET, GAS_FEEDER_WALLET];
+
+/// Flat per-signature fee. No compute-budget instructions are added, so this is
+/// the entire fee and it is known before signing. That is what lets a native
+/// sweep net the fee out of the swept value and still have
+/// amount + fee_paid == queued total on the ledger.
+pub const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+
+/// Legacy SPL token account size.
+const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
+/// Token-2022 ATAs carry ImmutableOwner at minimum; mints with required
+/// extensions make them bigger. Only used for the feeder pre-check — the
+/// simulation in build_and_sign is the real backstop.
+const TOKEN_2022_ACCOUNT_MIN_LEN: usize = 170;
 
 // ---------- derivation path ----------
 
@@ -676,7 +690,51 @@ pub struct SolParams {
     /// Owner of `to` (main wallet). `to` itself is the destination ATA for SPL.
     pub to_owner: String,
     pub create_dest_ata: bool,
+    /// Close the deposit ATA after draining it; its rent goes to the fee payer.
+    /// Honoured only when this transfer empties the account — CloseAccount on a
+    /// non-zero balance fails, and takes the transfer down with it.
     pub close_source: bool,
+
+    // ── Added with HD sweeping. `default` keeps rows planned before this
+    //    change deserializable.
+    /// The HD owner of the deposit. build_and_sign refuses to sign if the
+    /// authority_ref derives anything else.
+    #[serde(default)]
+    pub authority_address: Option<String>,
+    /// Gas feeder pubkey when `fee_payer` is set. Checked at signing, and read
+    /// by settle() so the Ledgerer debits the account that actually paid.
+    #[serde(default)]
+    pub fee_payer_address: Option<String>,
+    /// Native only: the fee comes out of the swept value, so the deposit ends
+    /// at exactly zero and amount + fee == queued total.
+    #[serde(default)]
+    pub fee_from_amount: bool,
+    /// AddressKind::as_str() of the custody pool the Ledgerer debits for fees.
+    /// settle() reads this key directly.
+    #[serde(default)]
+    pub fee_from: Option<String>,
+    /// Sum of the claimed sweep rows, normalized base units. Informational: a
+    /// tripwire for when a `Max` drain doesn't match what was recognized.
+    #[serde(default)]
+    pub queued_total: Option<String>,
+}
+
+/// `Max` drains whatever the chain holds, and the Ledgerer books exactly that.
+/// If it differs from what was recognized into sweep_queue, books and chain
+/// already disagree. The caller owns the guard against sweeping unconfirmed
+/// value, so this only shouts; it doesn't block.
+fn warn_if_unqueued(network: &str, addr: &str, p: &SolParams, leaving: u64) {
+    if let Some(q) = p.queued_total.as_deref() {
+        if q != leaving.to_string() {
+            eprintln!(
+                "[{network}] {addr}: sweeping {leaving} but sweep_queue recognized {q} — \
+                 ledger and chain disagree for this deposit"
+            );
+        }
+    }
+}
+fn to_u64(n: u128) -> Result<u64, String> {
+    u64::try_from(n).map_err(|_| format!("amount {n} does not fit in u64"))
 }
 
 
@@ -2604,7 +2662,166 @@ impl SolanaNetwork {
         let slot = self.get_slot(FINALIZED_COMMITMENT).await?;
         u64::try_from(slot).map_err(|_| "getSlot returned negative".to_string())
     }
+
+
+    async fn rent_exempt_min(&self, data_len: usize) -> Result<u64, String> {
+        let v = self.rpc("getMinimumBalanceForRentExemption", json!([data_len])).await?;
+        v.as_u64().ok_or_else(|| format!("getMinimumBalanceForRentExemption returned {v}"))
+    }
+
+    async fn account_exists(&self, address: &str) -> Result<bool, String> {
+        let r = self
+            .rpc("getAccountInfo", json!([address, { "encoding": "base64", "commitment": "confirmed" }]))
+            .await?;
+        Ok(r.get("value").map(|v| !v.is_null()).unwrap_or(false))
+    }
+
+    /// Dry-run the exact signed bytes. Nothing has been persisted yet and Solana
+    /// has no nonce to hand back, so a rejection here is free: the row stays
+    /// 'pending' and the next tick rebuilds against fresh state. The same
+    /// failure at broadcast would cost a whole blockhash lifetime before
+    /// Expired allowed a rebuild — and repeat forever if it's persistent
+    /// (empty feeder).
+    async fn simulate_signed(&self, raw: &[u8]) -> Result<(), String> {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let r = self
+            .rpc("simulateTransaction", json!([b64, {
+                "encoding": "base64",
+                "sigVerify": true,
+                "replaceRecentBlockhash": false,
+                "commitment": "confirmed",
+            }]))
+            .await?;
+        let v = r.get("value").unwrap_or(&r);
+        if !v["err"].is_null() {
+            let logs = v["logs"]
+                .as_array()
+                .map(|l| l.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" | "))
+                .unwrap_or_default();
+            return Err(format!("simulation rejected transfer: {} — {logs}", v["err"]));
+        }
+        Ok(())
+    }
 }
+
+
+/// Shared by every Solana token handler's Sweeper.
+///
+/// Only the HD path ever produces sweep rows: the reference path pays the
+/// merchant main wallet directly, so its movements land in custody_treasury,
+/// never custody_unswept. Anything other than a DepositAddress here is a bug
+/// upstream, not a case to handle.
+pub async fn plan_hd_sweep(
+    pool: &PgPool,
+    token_id: &str,
+    mint: Option<String>,
+    token_program: Option<String>,
+    decimals: u8,
+    d: &SweepDraft,
+) -> Result<TransferPlan, String> {
+    if d.custody_kind != AddressKind::DepositAddress {
+        return Err(format!(
+            "{token_id}: cannot sweep from {:?} — on Solana only HD deposit addresses hold unswept value",
+            d.custody_kind
+        ));
+    }
+
+    let source = SourceAccount {
+        address: d.custody_address.clone(),
+        kind: AddressKind::DepositAddress,
+        authority: d.authority,
+    };
+
+    match (mint, token_program) {
+        // ── Native SOL ───────────────────────────────────────────────────────
+        (None, _) => {
+            // The deposit address IS the HD keypair. A mismatch is a bad
+            // authority_ref from the connector; refuse here rather than at
+            // signing time.
+            if d.custody_address != d.authority_address {
+                return Err(format!(
+                    "native sweep: custody {} but authority {} ({}) — a system account \
+                     can only be debited by its own key",
+                    d.custody_address, d.authority_address, d.authority.to_ref()
+                ));
+            }
+
+            Ok(TransferPlan {
+                from: source,
+                to: d.destination.clone(),
+                // One deposit address per invoice, no shared pool: the whole
+                // balance is this invoice's, and the caller guarantees it's
+                // confirmed. Draining also means the account ends at exactly
+                // zero, so the rent rule can never bite on the source.
+                amount: TransferAmount::Max,
+                // Self-funded, like EVM native: the deposit pays its own
+                // signature fee out of the swept value and ends at zero. No
+                // dependency on the gas feeder for native sweeps.
+                fee_payer: None,
+                params: serde_json::to_value(SolParams {
+                    mint: None,
+                    token_program: None,
+                    decimals,
+                    to_owner: d.destination.clone(),
+                    create_dest_ata: false,
+                    close_source: false,
+                    authority_address: Some(d.authority_address.clone()),
+                    fee_payer_address: None,
+                    fee_from_amount: true,
+                    fee_from: Some(AddressKind::DepositAddress.as_str().to_string()),
+                    queued_total: Some(d.queued_total.normalize().to_string()),
+                })
+                    .map_err(|e| e.to_string())?,
+            })
+        }
+
+        // ── SPL / Token-2022 ─────────────────────────────────────────────────
+        (Some(mint), Some(program)) => {
+            // custody_address is the deposit ATA; authority is its HD owner.
+            let expect = derive_associated_token_address(&d.authority_address, &mint, &program)?;
+            if d.custody_address != expect {
+                return Err(format!(
+                    "SPL sweep: custody {} is not the {mint} ATA of authority {} ({}) — expected {expect}",
+                    d.custody_address, d.authority_address, d.authority.to_ref()
+                ));
+            }
+
+            // Destination is the main wallet's ATA, which may not exist yet.
+            let to = derive_associated_token_address(&d.destination, &mint, &program)?;
+
+            // The HD owner holds no lamports, so the gas feeder pays. Resolve
+            // its address now so signing can verify the derivation and
+            // settle() can book the fee against the right account.
+            let feeder = wallet_address(pool, d.merchant_id, NETWORK_TYPE, purpose::GAS_FEEDER).await?;
+
+            Ok(TransferPlan {
+                from: source,
+                to,
+                // Drain, so the ATA is always empty and always closes.
+                amount: TransferAmount::Max,
+                fee_payer: Some(SignerRef { role: KeyRole::Operational, index: operational::GAS_FEEDER }),
+                params: serde_json::to_value(SolParams {
+                    mint: Some(mint),
+                    token_program: Some(program),
+                    decimals,
+                    to_owner: d.destination.clone(),
+                    create_dest_ata: true,
+                    close_source: true,
+                    authority_address: Some(d.authority_address.clone()),
+                    fee_payer_address: Some(feeder),
+                    fee_from_amount: false,
+                    // Fed SOL, not revenue — custody_gas.
+                    fee_from: Some(AddressKind::Gas.as_str().to_string()),
+                    queued_total: Some(d.queued_total.normalize().to_string()),
+                })
+                    .map_err(|e| e.to_string())?,
+            })
+        }
+
+        (Some(_), None) => Err(format!("{token_id}: mint without token_program")),
+    }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Transaction parsing
@@ -2793,6 +3010,8 @@ fn parse_tx_view(signature: &str, raw: &Value) -> Result<TxView, String> {
     })
 }
 
+
+
 fn i128_to_decimal(v: i128) -> Result<Decimal, String> {
     // Base units, scale 0 — decimals are a presentation-layer concern.
     Decimal::try_from_i128_with_scale(v, 0).map_err(|e| format!("amount out of Decimal range: {e}"))
@@ -2908,62 +3127,178 @@ impl NetworkClient for SolanaNetwork {
         let p: SolParams = serde_json::from_value(req.params.clone())
             .map_err(|e| format!("params: {e}"))?;
 
-        let (auth_key, auth_addr) = derive_solana_keypair(mnemonic, req.from.authority.role, req.from.authority.index)?;
+        // ── Keys: derive, then check against what the plan recorded ─────────────
+        let (auth_key, auth_addr) =
+            derive_solana_keypair(mnemonic, req.from.authority.role, req.from.authority.index)?;
+        if let Some(expected) = p.authority_address.as_deref() {
+            if expected != auth_addr {
+                return Err(format!(
+                    "authority {} derives {auth_addr}, plan says {expected} — refusing to sign",
+                    req.from.authority.to_ref()));
+            }
+        }
+
         let (fee_key, fee_addr) = match req.fee_payer {
             Some(s) => derive_solana_keypair(mnemonic, s.role, s.index)?,
             None => (auth_key.clone(), auth_addr.clone()),
         };
+        if let (Some(s), Some(expected)) = (req.fee_payer, p.fee_payer_address.as_deref()) {
+            if expected != fee_addr {
+                return Err(format!(
+                    "fee payer {} derives {fee_addr}, plan says {expected} — refusing to sign",
+                    s.to_ref()));
+            }
+        }
+
+        let self_pays = fee_addr == auth_addr;
         let auth = decode_pubkey(&auth_addr)?;
         let payer = decode_pubkey(&fee_addr)?;
         let to = decode_pubkey(&req.to)?;
         let mut keys = vec![auth_key];
-        if fee_addr != auth_addr { keys.push(fee_key); }
-        let n_sigs = keys.len() as u64;
+        if !self_pays { keys.push(fee_key); }
+        let fee = LAMPORTS_PER_SIGNATURE * keys.len() as u64;
 
         let mut instrs = Vec::new();
         let amount: u64;
 
         match (&p.mint, &p.token_program) {
+            // ── Native SOL ───────────────────────────────────────────────────────
             (None, _) => {
-                // Native: from.address must be the authority itself.
                 if req.from.address != auth_addr {
-                    return Err(format!("native sweep: from {} != authority {}", req.from.address, auth_addr));
+                    return Err(format!("native sweep: from {} != authority {auth_addr}", req.from.address));
                 }
                 let bal = self.get_lamports(&auth_addr).await?;
-                amount = match req.amount {
-                    TransferAmount::Exact(n) => n as u64,
-                    TransferAmount::Max if fee_addr != auth_addr => bal,
-                    TransferAmount::Max => bal.checked_sub(5_000 * n_sigs)
-                        .ok_or_else(|| format!("{auth_addr}: {bal} lamports can't cover its own fee"))?,
+
+                // (total leaving the deposit, value reaching `to`)
+                let (gross, net) = match (req.amount, self_pays) {
+                    (TransferAmount::Exact(n), true) if p.fee_from_amount => {
+                        let n = to_u64(n)?;
+                        (n, n.saturating_sub(fee))
+                    }
+                    (TransferAmount::Exact(n), true) => {
+                        let n = to_u64(n)?;
+                        (n.checked_add(fee).ok_or("amount + fee overflows")?, n)
+                    }
+                    (TransferAmount::Exact(n), false) => { let n = to_u64(n)?; (n, n) }
+                    (TransferAmount::Max, true) => (bal, bal.saturating_sub(fee)),
+                    (TransferAmount::Max, false) => (bal, bal),
                 };
-                if amount == 0 { return Err(format!("{auth_addr}: nothing to sweep")); }
-                instrs.push(system_transfer(auth, to, amount));
-            }
-            (Some(mint_s), Some(prog_s)) => {
-                let expect_ata = derive_associated_token_address(&auth_addr, mint_s, prog_s)?;
-                if req.from.address != expect_ata {
-                    return Err(format!("SPL sweep: from {} is not the ATA of authority {} ({expect_ata})",
-                                       req.from.address, auth_addr));
+
+                if net == 0 {
+                    return Err(format!(
+                        "{auth_addr}: fee {fee} consumes the whole sweep of {gross} lamports — not sending"));
                 }
+                // Recognized figure is gross: fee + value both leave custody_unswept.
+                warn_if_unqueued(&self.network_name, &auth_addr, &p, gross);
+                if bal < gross {
+                    return Err(if p.fee_from_amount {
+                        // The ledger says more is confirmed here than the chain
+                        // holds: double-counted rows, or a sweep that landed
+                        // without settle().
+                        format!("{auth_addr}: plan asks {gross} lamports, balance is {bal}")
+                    } else {
+                        format!("{auth_addr}: has {bal} lamports, needs {gross}")
+                    });
+                }
+
+                // The runtime rejects any tx that leaves an account with
+                // 0 < lamports < rent-exempt minimum. A remainder means value
+                // arrived that isn't confirmed into sweep_queue yet; its rows will
+                // sweep it together next round.
+                let rent0 = self.rent_exempt_min(0).await?;
+                let left = bal - gross;
+                if left != 0 && left < rent0 {
+                    return Err(format!(
+                        "{auth_addr}: sweeping {gross} of {bal} would leave {left} lamports, under the \
+                     {rent0} rent-exempt minimum — waiting for the remainder's rows"));
+                }
+                // Same rule on the receiving side: an empty main wallet can't be
+                // brought into existence with less than the minimum.
+                let dest_bal = self.get_lamports(&req.to).await?;
+                if dest_bal.saturating_add(net) < rent0 {
+                    return Err(format!(
+                        "{}: holds {dest_bal}, receiving {net} would leave it under the {rent0} \
+                     rent-exempt minimum — fund the main wallet first", req.to));
+                }
+
+                instrs.push(system_transfer(auth, to, net));
+                amount = net;
+            }
+
+            // ── SPL / Token-2022 ─────────────────────────────────────────────────
+            (Some(mint_s), Some(prog_s)) => {
+                let expect_src = derive_associated_token_address(&auth_addr, mint_s, prog_s)?;
+                if req.from.address != expect_src {
+                    return Err(format!(
+                        "SPL sweep: from {} is not the ATA of authority {auth_addr} ({expect_src})",
+                        req.from.address));
+                }
+                let expect_to = derive_associated_token_address(&p.to_owner, mint_s, prog_s)?;
+                if req.to != expect_to {
+                    return Err(format!(
+                        "SPL sweep: to {} is not the {mint_s} ATA of {} ({expect_to})", req.to, p.to_owner));
+                }
+
                 let (mint, prog, src) = (decode_pubkey(mint_s)?, decode_pubkey(prog_s)?, decode_pubkey(&req.from.address)?);
-                amount = match req.amount {
-                    TransferAmount::Exact(n) => n as u64,
-                    TransferAmount::Max => self.get_token_account_amount(&req.from.address).await?,
+
+                let held = self.get_token_account_amount(&req.from.address).await?;
+                let net = match req.amount {
+                    TransferAmount::Exact(n) => {
+                        let n = to_u64(n)?;
+                        if n > held {
+                            return Err(format!("{}: plan asks {n} of {mint_s}, balance is {held}", req.from.address));
+                        }
+                        n
+                    }
+                    TransferAmount::Max => held,
                 };
-                if amount == 0 { return Err(format!("{}: token account empty", req.from.address)); }
+                if net == 0 {
+                    return Err(format!("{}: token account empty", req.from.address));
+                }
+                warn_if_unqueued(&self.network_name, &req.from.address, &p, net);
+
+                // Fee payer must cover the signature fee, plus the destination ATA's
+                // rent if this is the sweep that creates it. Fail before anything
+                // is persisted: "gas refill required", next tick retries.
+                let dest_exists = self.account_exists(&req.to).await?;
+                if !dest_exists && !p.create_dest_ata {
+                    return Err(format!("destination ATA {} does not exist and the plan says not to create it", req.to));
+                }
+                let rent_dest = if dest_exists {
+                    0
+                } else {
+                    let len = if prog_s.as_str() == TOKEN_2022_PROGRAM_ID {
+                        TOKEN_2022_ACCOUNT_MIN_LEN
+                    } else {
+                        SPL_TOKEN_ACCOUNT_LEN
+                    };
+                    self.rent_exempt_min(len).await?
+                };
+                let payer_bal = self.get_lamports(&fee_addr).await?;
+                let needed = fee + rent_dest;
+                if payer_bal < needed {
+                    return Err(format!("{fee_addr}: has {payer_bal} lamports, needs {needed} (gas refill required)"));
+                }
+
+                // Always idempotent-create when asked: it's a no-op if the ATA
+                // exists by the time this lands, and harmless if it was created in
+                // between.
                 if p.create_dest_ata {
                     instrs.push(ata_create_idempotent(payer, to, decode_pubkey(&p.to_owner)?, mint, prog));
                 }
-                instrs.push(token_transfer_checked(prog, src, mint, to, auth, amount, p.decimals));
-                if p.close_source {
-                    // Rent refunds the fee payer. Merchant-scoped either way.
+                instrs.push(token_transfer_checked(prog, src, mint, to, auth, net, p.decimals));
+                if p.close_source && net == held {
+                    // Rent refunds the fee payer. See transfer_status for why
+                    // that's logged, not booked.
                     instrs.push(token_close(prog, src, payer, auth));
                 }
+                amount = net;
             }
+
             (Some(_), None) => return Err("SPL sweep without token_program".into()),
         }
 
-        // Fresh blockhash — do NOT use the cached one, the cache TTL eats validity window.
+        // Fresh blockhash — not the cached one; the cache TTL eats validity window.
         let bh = self.rpc("getLatestBlockhash", json!([{ "commitment": "confirmed" }])).await?;
         let v = bh.get("value").unwrap_or(&bh);
         let blockhash = decode_pubkey(v["blockhash"].as_str().ok_or("no blockhash")?)?;
@@ -2972,12 +3307,17 @@ impl NetworkClient for SolanaNetwork {
         let (msg, signers) = compile(payer, &instrs, blockhash);
         let (raw, sig) = sign(&msg, &signers, &keys)?;
 
+        self.simulate_signed(&raw).await?;
+
         Ok(SignedTransfer {
-            tx_hash: sig, raw, amount: amount as u128,
+            tx_hash: sig,
+            raw,
+            amount: amount as u128,
             from: req.from.address.clone(),
             valid_until: Some(last_valid),
             nonce: None,
-            fee_estimate: Some(5_000 * n_sigs as u128),
+            // Exact signature fee. ATA rent is not a fee and isn't included.
+            fee_estimate: Some(fee as u128),
         })
     }
 
@@ -3012,9 +3352,31 @@ impl NetworkClient for SolanaNetwork {
         }
         let slot = st["slot"].as_u64().unwrap_or(0);
         let tx = self.rpc("getTransaction", json!([signed.tx_hash,
-            { "encoding": "json", "commitment": "finalized", "maxSupportedTransactionVersion": 0 }])).await?;
-        let fee_paid = tx["meta"]["fee"].as_u64().unwrap_or(0) as u128;
-        Ok(TransferStatus::Confirmed { block: slot, fee_paid })
+        { "encoding": "json", "commitment": "finalized", "maxSupportedTransactionVersion": 0 }])).await?;
+        let meta = &tx["meta"];
+        let fee_paid = meta["fee"].as_u64().unwrap_or(0);
+
+        // Account 0 is always the fee payer. When it isn't the source (SPL sweeps
+        // paid by the gas feeder), any lamport change beyond the fee is ATA rent:
+        // positive = paid out creating the destination ATA, negative = reclaimed
+        // closing the deposit ATA. settle() books only fee_paid, so this is the
+        // custody_gas drift until gas management books rent explicitly.
+        let payer0 = tx["transaction"]["message"]["accountKeys"][0].as_str();
+        if payer0.is_some() && payer0 != Some(signed.from.as_str()) {
+            if let (Some(pre), Some(post)) =
+                (meta["preBalances"][0].as_u64(), meta["postBalances"][0].as_u64())
+            {
+                let rent_net = pre as i128 - post as i128 - fee_paid as i128;
+                if rent_net != 0 {
+                    eprintln!(
+                        "[{}] {}: fee payer {} rent {} {} lamports (not on the ledger)",
+                        self.network_name, signed.tx_hash, payer0.unwrap_or("?"),
+                        if rent_net > 0 { "paid" } else { "reclaimed" }, rent_net.abs()
+                    );
+                }
+            }
+        }
+        Ok(TransferStatus::Confirmed { block: slot, fee_paid: fee_paid as u128 })
     }
 
     fn outbound_poll_interval(&self) -> Duration { Duration::from_secs(5) }

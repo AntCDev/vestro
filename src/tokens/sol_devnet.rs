@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::assets::{AssetKey, AssetKind, AssetSpec, ChainRef, NETWORK_SOLANA};
 use crate::keys::derivation::{operational, KeyRole};
-use crate::networks::sol::{derive_associated_token_address, SolParams, SolanaNetwork};
+use crate::networks::sol::{derive_associated_token_address, plan_hd_sweep, SolParams, SolanaNetwork};
 use crate::networks::{NetworkClient, NetworkRegistry, SolanaCluster};
 use crate::tokens::checkout::{CheckoutContext, CheckoutView, PresignContext};
 use crate::keys::store::load_merchant_seed;
@@ -159,34 +159,17 @@ impl TokenHandler for DevnetHandler {
 
 #[async_trait]
 impl Sweeper for DevnetHandler {
-    async fn plan(&self, _pool: &PgPool, d: &SweepDraft) -> Result<TransferPlan, String> {
-        if d.custody_kind != AddressKind::DepositAddress {
-            return Err(format!("cannot sweep from {:?}", d.custody_kind));
-        }
+    async fn plan(&self, pool: &PgPool, d: &SweepDraft) -> Result<TransferPlan, String> {
         let asset = &self.descriptor.asset;
-        let mint = asset.key.address.clone();
-        let token_program = asset.param_str("token_program").map(str::to_string);
-
-        // For SPL, `to` is the main wallet's ATA — which may not exist yet.
-        let to = match (&mint, &token_program) {
-            (Some(m), Some(p)) => derive_associated_token_address(&d.destination, m, p)?,
-            (Some(_), None) => return Err(format!("{}: mint without token_program", self.token_id())),
-            _ => d.destination.clone(),
-        };
-
-        Ok(TransferPlan {
-            from: SourceAccount { address: d.custody_address.clone(), kind: d.custody_kind, authority: d.authority },
-            to,
-            amount: TransferAmount::Max,
-            fee_payer: Some(SignerRef { role: KeyRole::Operational, index: operational::GAS_FEEDER }),
-            params: serde_json::to_value(SolParams {
-                decimals: asset.decimals,
-                to_owner: d.destination.clone(),
-                create_dest_ata: mint.is_some(),
-                close_source: mint.is_some(),
-                mint, token_program,
-            }).unwrap(),
-        })
+        plan_hd_sweep(
+            pool,
+            self.token_id(),
+            asset.key.address.clone(),
+            asset.param_str("token_program").map(str::to_string),
+            asset.decimals,
+            d,
+        )
+            .await
     }
 }
 

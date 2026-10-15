@@ -215,6 +215,7 @@ impl TryFrom<TransferDbRow> for TransferRow {
             nonce: r.nonce,
             valid_until: r.valid_until,
             fee_estimate: r.fee_estimate,
+            signer_address: None,
         })
     }
 }
@@ -593,6 +594,15 @@ async fn settle(pool: &PgPool, ledger: &Ledgerer, row: &TransferRow, signed: &Si
             row.req.from.kind
         });
 
+    // The account that actually spent the gas: the deposit address itself,
+    // the merchant wallet that called sweep() — never the vault — or, on
+    // Solana SPL sweeps, the gas feeder named in params. `signed.from` there
+    // is the deposit ATA, which has no key and pays nothing.
+    let fee_from_address = row.req.params
+        .get("fee_payer_address")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| signed.from.clone());
 
     ledger.record_outbound(&mut tx, &OutboundSettled {
         transfer_id: row.id,
@@ -610,9 +620,7 @@ async fn settle(pool: &PgPool, ledger: &Ledgerer, row: &TransferRow, signed: &Si
         amount: Decimal::from_str_exact(&signed.amount.to_string()).map_err(|e| e.to_string())?,
         fee_paid: Decimal::from_str_exact(&fee_paid.to_string()).map_err(|e| e.to_string())?,
         fee_from_kind,
-        // The account that actually spent the gas: the deposit address itself,
-        // or the merchant wallet that called sweep() — never the vault.
-        fee_from_address: signed.from.clone(),
+        fee_from_address,
 
     }).await?;
 

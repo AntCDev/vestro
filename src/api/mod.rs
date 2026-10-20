@@ -5,4 +5,4 @@ use async_trait::async_trait;
 
 pub mod invoices;
 pub mod merchants;
-pub mod tests;
+pub mod probe;

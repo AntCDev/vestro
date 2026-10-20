@@ -1,11 +1,6 @@
 use sqlx::postgres::PgPoolOptions;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
-use tower_http::compression::CompressionLayer;
 use std::env;
 use std::sync::Arc;
-use axum::{routing::{get, post}, Router};
-use crate::api::invoices::{get_invoice_blockhash_handler, get_invoice_checkout_handler, get_invoice_status_handler};
 
 // Register our modules globally
 mod networks;
@@ -15,6 +10,7 @@ mod api;
 mod orchestrator;
 mod assets;
 mod ledgerer;
+mod routes;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,10 +21,7 @@ pub struct AppState {
 }
 
 async fn initialize_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await?;
-
+    sqlx::migrate!("./migrations").run(pool).await?;
     println!("Database tables initialized successfully.");
     Ok(())
 }
@@ -59,62 +52,36 @@ async fn main() {
         .expect("Failed to initialize database tables");
     println!(" Done.");
 
-    // 1. Instantiate the networks ONCE on load & spawn payment watchers
+    // 1. Instantiate the networks ONCE on load
     let networks = Arc::new(networks::NetworkRegistry::from_env());
 
     // 2. Pass the singletons down to the token registry so handlers can clone the Arcs
     let registry = Arc::new(tokens::TokenRegistry::new(networks.clone()));
 
+    // 3. Orchestrator
     let orchestrator = Arc::new(orchestrator::PaymentOrchestrator::new(
         pool.clone(),
         registry.clone(),
     ));
 
-    // 3. Instantiate Orchestrator and pass the required dependencies
     // Code is authoritative: overwrites the assets rows on every boot.
     orchestrator.sync_assets().await.expect("Failed to sync assets");
 
     // DB is authoritative: never overwrites an operator's view mapping.
     registry.sync_checkout_views(&pool).await.expect("Failed to sync checkout views");
+
+    // 4. Spawn payment watchers
     networks.spin_up_all(&pool);
 
     let state = AppState { pool, networks, registry, orchestrator };
-
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    let app = Router::new()
-        .route("/api/invoices", post(api::invoices::create_invoice_handler))
-        .route("/api/merchants", post(api::merchants::signup_merchant_handler))
-        .route("/invoice", get(api::invoices::invoice_redirect_handler))
-        .route("/api/invoices/{id}/checkout", get(get_invoice_checkout_handler))
-        .route("/api/invoices/{id}/status",   get(get_invoice_status_handler))
-        .route("/api/invoices/{id}/solana/blockhash", get(get_invoice_blockhash_handler))
-
-        // Inspection / Test routes
-        .route("/api/test/tokens", get(api::tests::list_tokens_test_handler))
-        .route("/api/test/networks", get(api::tests::list_networks_test_handler))
-        .route("/api/test/merchants", get(api::tests::list_merchants_test_handler))
-        .route("/api/test/ledger", get(api::tests::ledger_overview_test_handler))
-
-        .route("/api/test/sweeps", get(api::tests::list_sweepable_test_handler))
-        .route("/api/test/sweeps", post(api::tests::sweep_address_test_handler))
-        .route("/api/test/transfers/{id}", get(api::tests::get_transfer_test_handler))
-
-        // Middleware
-        .fallback_service(ServeDir::new("wwwroot"))
-        .layer(cors)
-        .layer(CompressionLayer::new())
-        .with_state(state);
+    let app = routes::build(state);
 
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
         .expect("PORT must be a valid number");
 
-    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let ip: std::net::IpAddr = host.parse().expect("HOST must be a valid IP address");
     let addr = std::net::SocketAddr::from((ip, port));
 
